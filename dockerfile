@@ -18,6 +18,8 @@ RUN find /wheels -type f -name 'opencv_python-*.whl' -delete
 # ── Runtime stage ─────────────────────────────────────────────────────────────
 FROM python:3.11-slim
 WORKDIR /app
+ARG SOURCE_REVISION=unknown
+ENV POSTERSPLUS_SOURCE_REVISION=${SOURCE_REVISION}
 
 # libcairo2 (runtime only — no -dev headers needed) for pycairo;
 # gosu for privilege drop in entrypoint.sh.

@@ -8,18 +8,22 @@ services:
         # BAKE_PPOCR_MODEL=false in your .env for a lean image that downloads the
         # model once at runtime instead.
         BAKE_PPOCR_MODEL: "${BAKE_PPOCR_MODEL:-true}"
+        SOURCE_REVISION: "${POSTERSPLUS_SOURCE_REVISION:-unknown}"
     image: PostersPlus
     ports:
       - "8000:8000"
     restart: unless-stopped
     volumes:
       - ./postersplus-cache:/app/cache  # cache DB, TMDB posters/logos, discovery_overrides.json
+      - ./profile.example.yml:/app/profile.yml:ro  # copy/customize, then set RENDER_PROFILE_PATH=/app/profile.yml
     env_file:
       - .env # see this file for an explanation of what each flag does
     environment: 
       - TMDB_API_KEY=${TMDB_API_KEY:-}
       - MDBLIST_API_KEY=${MDBLIST_API_KEY:-}
       - ACCESS_KEY=${ACCESS_KEY:-}
+      - HEADER_ONLY_AUTH=${HEADER_ONLY_AUTH:-false}
+      - RENDER_PROFILE_PATH=${RENDER_PROFILE_PATH:-}
       - WORKERS=${WORKERS:-1}
       - TEXTLESS_DETECTION_CONCURRENCY=${TEXTLESS_DETECTION_CONCURRENCY:-2}
       - TEXTLESS_DETECTION_MAX_VOTES=${TEXTLESS_DETECTION_MAX_VOTES:-3000}

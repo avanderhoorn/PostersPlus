@@ -131,7 +131,13 @@ All configuration is done via environment variables. Copy `.env.example` to `.en
 | `MDBLIST_API_KEY` | - | MDBList API key for ratings and award data |
 | `MDBLIST_API_KEY_2` | - | Optional second MDBList key. Retried in the same request when the primary key is rate-limited |
 | `MDBLIST_CONCURRENCY` | `3` | Maximum concurrent outbound MDBList requests per worker |
-| `ACCESS_KEY` | - | Shared secret for request authentication. Leave blank to allow open access |
+| `ACCESS_KEY` | - | Shared secret accepted in `X-Jellyfin-Artwork-Key`; legacy routes also accept `access_key` in the query unless header-only mode is enabled |
+| `HEADER_ONLY_AUTH` | `false` | Require header authentication globally. `/health` and static configurator assets remain anonymous; `/render/selected` is always header-only |
+| `RENDER_PROFILE_PATH` | - | Path to one read-only mounted YAML render profile (see `profile.example.yml`) |
+| `POSTERSPLUS_SOURCE_REVISION` | `unknown` | Exact source commit reported by `/ready`; release images set this automatically |
+| `SELECTED_MAX_BYTES` | `10485760` | Maximum encoded request-body size for `/render/selected` |
+| `SELECTED_MAX_WIDTH` / `SELECTED_MAX_HEIGHT` | `8000` | Maximum decoded selected-image dimensions |
+| `SELECTED_MAX_PIXELS` | `20000000` | Maximum decoded selected-image pixel count |
 | `WORKERS` | `1` | Uvicorn worker processes. One worker avoids duplicate uncached renders, scans, and API work across processes |
 | `AIOSTREAMS_URL` | - | Base URL of your AIOStreams instance (used when `QUALITY_SOURCE=aiostreams`) |
 | `AIOSTREAMS_AUTH` | - | AIOStreams credentials as Base64 `user:password` |
@@ -246,11 +252,36 @@ Append `&debug=1` to any poster URL to receive a JSON response with all computed
 
 Append `&nocache=1` (requires `ACCESS_KEY` to be set and valid) to force a fresh render of a single title, bypassing the composite cache read and re-caching the result. Lets you refresh one poster without flushing the whole cache.
 
+### Private selected-image renderer
+
+`POST /render/selected` composites against the exact JPEG, PNG, or WebP bytes
+selected by the caller instead of downloading base artwork. It accepts no source
+URL and requires `X-Jellyfin-Artwork-Key`, a loaded named profile, `tmdb_id`,
+`imdb_id`, and `type`; `quality`, season/episode, and `output_format`
+(`jpeg`, `png`, or `webp`) are optional per-item context.
+
+```bash
+curl --fail-with-body \
+  -H "X-Jellyfin-Artwork-Key: $ACCESS_KEY" \
+  -H "Content-Type: image/jpeg" \
+  --data-binary @primary.jpg \
+  "http://postersplus:8000/render/selected?profile=homestack-default&type=movie&tmdb_id=123&imdb_id=tt1234567"
+```
+
+The response includes an accurate `Content-Type`, standard `Digest`,
+hexadecimal `X-Image-SHA256`, `X-Render-Profile-SHA256`, and
+`X-Renderer-Revision`. The service rejects oversized, malformed,
+MIME-mismatched, or decompression-bomb inputs. Profile defaults use the same
+validated request-configuration path as `/poster`; visual query overrides are
+not accepted on this endpoint. Mount the profile read-only and set
+`RENDER_PROFILE_PATH=/app/profile.yml`.
+
 ### Operator endpoints
 
-These are gated behind `access_key` when one is configured:
+These are gated by the configured access key:
 
 - `GET /stats`: cache row counts / sizes plus live runtime state (in-flight renders, background fetches, MDBList key cooldowns). Handy for spotting issues before they surface.
+- `GET /ready`: readiness plus the loaded profile name/content digest and exact renderer source revision. It never returns credentials.
 - `GET /debug/fallback-gallery`: a gallery of every genre's no-art fallback card (mascot + genre font), also reachable via the **Preview fallback art** button in the configurator's Logo section.
 
 ---
@@ -331,3 +362,9 @@ Join the discord here to request features, follow development or report bugs: ht
 ## License
 
 This project and any associated forks should remain open source under the [GNU Affero General Public License v3.0](LICENSE)
+
+Fork images published as `ghcr.io/avanderhoorn/postersplus` are built from this
+corresponding source tree. Their exact commit is embedded at build time and
+reported by authenticated `GET /ready`; retain the image digest and revision
+together when recording provenance. Upstream PostersPlus is maintained at
+<https://github.com/UmbraProjects/PostersPlus>.

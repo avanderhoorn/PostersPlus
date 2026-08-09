@@ -8,6 +8,14 @@
 #     or the project README for a ready-made sample.
 import os
 
+
+def _parse_bool_env(key: str, default: bool = False) -> bool:
+    val = os.environ.get(key, "").strip().lower()
+    if not val:
+        return default
+    return val not in ("0", "false", "no")
+
+
 # Storage
 
 DB_PATH               = "/app/cache/cache.db"
@@ -18,6 +26,13 @@ TMDB_LOGO_CACHE_DIR   = "/app/cache/tmdb_logos" # base logos from TMDB
 # Environment
 
 ACCESS_KEY            = os.environ.get("ACCESS_KEY")
+HEADER_ONLY_AUTH      = _parse_bool_env("HEADER_ONLY_AUTH", False)
+RENDER_PROFILE_PATH   = os.environ.get("RENDER_PROFILE_PATH", "").strip()
+SOURCE_REVISION       = os.environ.get("POSTERSPLUS_SOURCE_REVISION", "unknown").strip() or "unknown"
+SELECTED_MAX_BYTES    = max(1, int(os.environ.get("SELECTED_MAX_BYTES", str(10 * 1024 * 1024))))
+SELECTED_MAX_WIDTH    = max(1, int(os.environ.get("SELECTED_MAX_WIDTH", "8000")))
+SELECTED_MAX_HEIGHT   = max(1, int(os.environ.get("SELECTED_MAX_HEIGHT", "8000")))
+SELECTED_MAX_PIXELS   = max(1, int(os.environ.get("SELECTED_MAX_PIXELS", "20000000")))
 AIOSTREAMS_URL        = os.environ.get("AIOSTREAMS_URL", "")
 AIOSTREAMS_AUTH       = os.environ.get("AIOSTREAMS_AUTH", "")
 
@@ -130,12 +145,6 @@ COMPOSITE_MAX_ENTRIES      = int(os.environ.get("COMPOSITE_MAX_ENTRIES", "0"))
 # entirely. Every request re-renders from scratch. Useful during development when
 # iterating on rendering changes and you don't want stale renders served.
 DISABLE_COMPOSITE_CACHE    = os.environ.get("DISABLE_COMPOSITE_CACHE", "").strip().lower() in ("1", "true", "yes")
-
-def _parse_bool_env(key: str, default: bool = False) -> bool:
-    val = os.environ.get(key, "").strip().lower()
-    if not val:
-        return default
-    return val not in ("0", "false", "no")
 
 # Logo legibility: when a flat logo's average colour is too close to the poster
 # background, recolour it (white / black / complementary accent) so it reads.
