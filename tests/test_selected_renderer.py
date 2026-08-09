@@ -14,6 +14,7 @@ from starlette.responses import Response
 
 import main
 from render_profile import RenderProfile, load_render_profile
+import text_detect
 
 
 def _image_bytes(image_format: str, size=(4, 3), color=(12, 34, 56)) -> bytes:
@@ -215,6 +216,35 @@ class ProfileTests(unittest.TestCase):
             load_render_profile(path, set(main._PROFILE_DEFAULT_FIELDS))
 
 
+class TextDetectionModelTests(unittest.TestCase):
+    @unittest.skipUnless(text_detect._HAS_RAPIDOCR, "RapidOCR is not installed")
+    def test_installed_bundled_models_resolve(self):
+        for model_path in (
+            text_detect._CLS_MODEL_PATH,
+            text_detect._REC_MODEL_PATH,
+        ):
+            with self.subTest(model_path=model_path):
+                self.assertTrue(model_path)
+                self.assertTrue(Path(model_path).is_file())
+
+    def test_bundled_model_discovery_tolerates_versioned_names(self):
+        with tempfile.TemporaryDirectory() as directory:
+            expected = Path(directory) / "ch_ppocr_mobile_v2.0_cls_mobile.onnx"
+            expected.touch()
+            (Path(directory) / "PP-OCRv6_rec_small.onnx").touch()
+
+            self.assertEqual(
+                text_detect._find_bundled_model(Path(directory), "cls"),
+                str(expected),
+            )
+
+    def test_model_readiness_requires_a_loaded_session_pool(self):
+        with patch.object(text_detect, "_ocr_pool", None):
+            self.assertFalse(text_detect.text_detection_ready())
+        with patch.object(text_detect, "_ocr_pool", object()):
+            self.assertTrue(text_detect.text_detection_ready())
+
+
 class AuthenticationTests(unittest.IsolatedAsyncioTestCase):
     async def _get(self, path: str, headers=None):
         transport = httpx.ASGITransport(app=main.app)
@@ -249,6 +279,7 @@ class AuthenticationTests(unittest.IsolatedAsyncioTestCase):
             patch.object(main._cfg, "HEADER_ONLY_AUTH", False),
             patch.object(main._cfg, "SOURCE_REVISION", "abc123"),
             patch.object(main, "_render_profile", profile),
+            patch.object(main, "_text_detector_ready", return_value=True),
         ):
             header = await self._get(
                 "/ready",
@@ -259,6 +290,21 @@ class AuthenticationTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(query.status_code, 200)
         self.assertEqual(header.json()["renderer_revision"], "abc123")
         self.assertEqual(header.json()["profile"]["digest"], "digest")
+
+    async def test_ready_rejects_failed_text_detector(self):
+        profile = RenderProfile("homestack-default", {}, "digest")
+        with (
+            patch.object(main._cfg, "ACCESS_KEY", "secret"),
+            patch.object(main._cfg, "HEADER_ONLY_AUTH", True),
+            patch.object(main._cfg, "TEXTLESS_TEXT_DETECTION", True),
+            patch.object(main, "_render_profile", profile),
+            patch.object(main, "_text_detector_ready", return_value=False),
+        ):
+            response = await self._get(
+                "/ready",
+                headers={"X-Jellyfin-Artwork-Key": "secret"},
+            )
+        self.assertEqual(response.status_code, 503)
 
     async def test_header_only_mode_rejects_query_key(self):
         with (
