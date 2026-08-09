@@ -1,0 +1,57 @@
+name: homestack-default
+defaults:
+  primary_client: jellyfin
+  top_gradient: medium
+  bottom_gradient: low
+  hide_genre: true
+  fallback_to_imdb: true
+  rating_display_mode: 3
+  frost_reference: true
+  score_color_mode: 2
+  minimalist_append_mode: 2
+  minimalist_mode_font_size_ratio: 0.056
+  minimalist_mode_font_x_offset: 0.065
+  minimalist_mode_font_y_offset: 0.930
+  minimalist_score_out_of_10: true
+  movie_weights:
+    letterboxd: 0.98
+    trakt: 0.01
+    tomatoes: 0.00
+    popcorn: 0.00
+    imdb: 0.00
+    metacritic: 0.00
+    metacriticuser: 0.00
+    tmdb: 0.00
+    rogerebert: 0.00
+    myanimelist: 0.00
+    anilist: 0.00
+    kitsu: 0.00
+  tv_weights:
+    trakt: 0.80
+    tomatoes: 0.20
+    popcorn: 0.00
+    imdb: 0.00
+    metacritic: 0.00
+    metacriticuser: 0.00
+    tmdb: 0.00
+    myanimelist: 0.00
+    anilist: 0.00
+    kitsu: 0.00
+  textless: false
+  use_original_art: false
+  original_art_source: top_rated
+  logo_language: en
+  logo_priority: native_original
+  fallback_bg_style: photoreal
+  logo_max_w_ratio: 0.75
+  logo_max_h_ratio: 0.25
+  logo_bottom_ratio: 0.09
+  sash_mode: hidden
+  cinema_greyscale: true
+  cinema_greyscale_skip_if_available: false
+  release_status_cinema_only: false
+  badge_display_mode: 4
+  badge_height: 20
+  badge_anchor_x: 0.050
+  badge_anchor_y: 0.025
+  badge_min_score: 5

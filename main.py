@@ -1,5 +1,6 @@
 #main.py
 import asyncio
+import base64
 import hashlib
 import hmac
 import io
@@ -7,6 +8,7 @@ import logging
 import os
 import re
 import time
+import warnings
 import httpx
 import numpy as np
 from datetime import datetime, timedelta, timezone
@@ -18,7 +20,7 @@ from urllib.parse import parse_qsl, urlencode
 from fastapi import FastAPI, HTTPException, Request
 from fastapi.responses import JSONResponse, Response, HTMLResponse
 from fastapi.staticfiles import StaticFiles
-from PIL import Image, ImageDraw, ImageFont, ImageOps
+from PIL import Image, ImageDraw, ImageFont, ImageOps, UnidentifiedImageError
 
 logging.basicConfig(
     level=logging.INFO,
@@ -577,6 +579,7 @@ from cache import (
 )
 from digital_release import digital_release_poll_loop
 import config as _cfg
+from render_profile import RenderProfile, load_render_profile
 from discovery import (
     ALL_PRIORITY_SLOTS,
     FESTIVAL_KEYWORDS,
@@ -663,6 +666,23 @@ def _make_http_client() -> httpx.AsyncClient:
 _TMDB_ID_RE  = re.compile(r'^\d{1,10}$')
 _IMDB_ID_RE  = re.compile(r'^tt\d{1,10}$')
 _VALID_TYPES = frozenset({"movie", "tv", "series"})
+_SELECTED_CONTENT_TYPES = {
+    "image/jpeg": "JPEG",
+    "image/png": "PNG",
+    "image/webp": "WEBP",
+}
+_OUTPUT_FORMATS = {
+    "jpeg": ("JPEG", "image/jpeg"),
+    "png": ("PNG", "image/png"),
+    "webp": ("WEBP", "image/webp"),
+}
+
+
+@dataclass(frozen=True)
+class _SelectedImage:
+    image: Image.Image
+    sha256: str
+    decoded_format: str
 
 
 def _check_tmdb_id(val: str) -> None:
@@ -723,6 +743,170 @@ def _resolve_anime_request(
             raise HTTPException(status_code=400, detail=f"Invalid {namespace}_id")
         return namespace, parsed
     return None, None
+
+
+def _access_key_matches(candidate: str) -> bool:
+    if not _cfg.ACCESS_KEY:
+        return False
+    return hmac.compare_digest(
+        candidate.encode("utf-8"),
+        _cfg.ACCESS_KEY.encode("utf-8"),
+    )
+
+
+async def _read_selected_body(request: Request) -> bytes:
+    content_length = request.headers.get("content-length")
+    if content_length:
+        try:
+            declared_length = int(content_length)
+        except ValueError as exc:
+            raise HTTPException(status_code=400, detail="Invalid Content-Length") from exc
+        if declared_length < 0:
+            raise HTTPException(status_code=400, detail="Invalid Content-Length")
+        if declared_length > _cfg.SELECTED_MAX_BYTES:
+            raise HTTPException(status_code=413, detail="Selected image body is too large")
+
+    body = bytearray()
+    async for chunk in request.stream():
+        body.extend(chunk)
+        if len(body) > _cfg.SELECTED_MAX_BYTES:
+            raise HTTPException(status_code=413, detail="Selected image body is too large")
+    if not body:
+        raise HTTPException(status_code=400, detail="Selected image body is empty")
+    return bytes(body)
+
+
+def _decode_selected_image(body: bytes, content_type: str) -> _SelectedImage:
+    media_type = content_type.split(";", 1)[0].strip().lower()
+    expected_format = _SELECTED_CONTENT_TYPES.get(media_type)
+    if expected_format is None:
+        raise HTTPException(
+            status_code=415,
+            detail="Content-Type must be image/jpeg, image/png, or image/webp",
+        )
+
+    try:
+        with warnings.catch_warnings():
+            warnings.simplefilter("error", Image.DecompressionBombWarning)
+            with Image.open(io.BytesIO(body)) as probe:
+                decoded_format = (probe.format or "").upper()
+                width, height = probe.size
+                if decoded_format != expected_format:
+                    raise HTTPException(
+                        status_code=415,
+                        detail="Content-Type does not match the decoded image format",
+                    )
+                if (
+                    width > _cfg.SELECTED_MAX_WIDTH
+                    or height > _cfg.SELECTED_MAX_HEIGHT
+                    or width * height > _cfg.SELECTED_MAX_PIXELS
+                ):
+                    raise HTTPException(
+                        status_code=413,
+                        detail="Selected image dimensions exceed configured limits",
+                    )
+                probe.verify()
+
+            with Image.open(io.BytesIO(body)) as decoded:
+                decoded.load()
+                image = decoded.convert("RGBA")
+    except HTTPException:
+        raise
+    except (Image.DecompressionBombError, Image.DecompressionBombWarning) as exc:
+        raise HTTPException(
+            status_code=413,
+            detail="Selected image exceeds Pillow decompression safety limits",
+        ) from exc
+    except (UnidentifiedImageError, OSError, ValueError, SyntaxError) as exc:
+        raise HTTPException(status_code=400, detail="Malformed selected image") from exc
+
+    return _SelectedImage(
+        image=image,
+        sha256=hashlib.sha256(body).hexdigest(),
+        decoded_format=decoded_format,
+    )
+
+
+def _image_response(
+    content: bytes,
+    output_format: str,
+    cache_key: str | None = None,
+) -> Response:
+    _, media_type = _OUTPUT_FORMATS[output_format]
+    digest = hashlib.sha256(content).digest()
+    response = Response(content=content, media_type=media_type)
+    response.headers["Digest"] = f"sha-256={base64.b64encode(digest).decode('ascii')}"
+    response.headers["X-Image-SHA256"] = digest.hex()
+    if cache_key is not None:
+        response.headers["ETag"] = f'"{cache_key}"'
+    if _cfg.DISABLE_COMPOSITE_CACHE:
+        response.headers["Cache-Control"] = "no-store, no-cache, must-revalidate"
+        response.headers["Pragma"] = "no-cache"
+    elif _cfg.CDN_CACHE_TTL > 0:
+        response.headers["Cache-Control"] = f"public, max-age={_cfg.CDN_CACHE_TTL}"
+    return response
+
+
+def _encode_rendered_image(image: Image.Image, output_format: str) -> bytes:
+    pil_format, _ = _OUTPUT_FORMATS[output_format]
+    encoded = image if pil_format == "PNG" else image.convert("RGB")
+    save_kwargs = {}
+    if pil_format == "JPEG":
+        save_kwargs["quality"] = _cfg.JPEG_QUALITY
+    elif pil_format == "WEBP":
+        save_kwargs["quality"] = _cfg.WEBP_QUALITY
+    buffer = io.BytesIO()
+    encoded.save(buffer, format=pil_format, **save_kwargs)
+    return buffer.getvalue()
+
+
+def _resolve_output_format(output_format: str | None) -> str:
+    resolved = (output_format or _cfg.IMAGE_FORMAT).lower()
+    if resolved not in _OUTPUT_FORMATS:
+        raise HTTPException(status_code=400, detail="Invalid output_format")
+    return resolved
+
+
+def _selected_cache_identity(
+    *,
+    base_identity: str,
+    selected_sha256: str,
+    profile_digest: str,
+    renderer_revision: str,
+    imdb_id: str,
+    tmdb_id: str,
+    media_type: str,
+    quality: str,
+    season: int,
+    episode: int,
+    output_format: str,
+) -> str:
+    return (
+        base_identity
+        + f"|base={selected_sha256}"
+        + f"|profile={profile_digest}"
+        + f"|revision={renderer_revision}"
+        + f"|ids={imdb_id}:{tmdb_id}:{media_type}"
+        + f"|quality={quality}"
+        + f"|episode={season}:{episode}"
+        + f"|output={output_format}"
+    )
+
+
+def _client_cache_key(
+    render_cache_key: str | None,
+    selected_image: _SelectedImage | None,
+) -> str | None:
+    return render_cache_key if selected_image is None else None
+
+
+def _selected_final_cache_key(
+    imdb_id: str,
+    tmdb_id: str,
+    media_type: str,
+    params_hash: str,
+) -> str:
+    return f"{imdb_id}:{tmdb_id}:{media_type}:selected:{params_hash}"
 
 
 # ---------------------------------------------------------------------------
@@ -1189,6 +1373,21 @@ def build_request_config(params: dict) -> RequestConfig:
     cfg.sash_text_color      = _parse_hex_color(params.get("sash_text_color"))
 
     return cfg
+
+
+_PROFILE_DEFAULT_FIELDS = frozenset(RequestConfig.__dataclass_fields__) | {
+    "combined_badge_min_score",
+    "logo_native_fallback",
+    "primary_client",
+    "show_quality_badges",
+}
+_render_profile: RenderProfile | None = None
+
+
+def _load_configured_render_profile() -> RenderProfile | None:
+    if not _cfg.RENDER_PROFILE_PATH:
+        return None
+    return load_render_profile(_cfg.RENDER_PROFILE_PATH, set(_PROFILE_DEFAULT_FIELDS))
 
 
 # ---------------------------------------------------------------------------
@@ -2627,6 +2826,7 @@ async def _cache_warm_loop(digital_release_ready: asyncio.Event | None = None) -
 async def lifespan(app: FastAPI):
     global _HTTP_CLIENT, _configurator_html, _render_assets_signature
     global _background_detection_queue, _background_detection_task
+    global _render_profile
     init_db()
     logger.info(f"Cache initialised (composite TTL {_cfg.COMPOSITE_CACHE_TTL}s / "
                 f"{_cfg.COMPOSITE_CACHE_TTL / 86400:.1f}d)")
@@ -2652,6 +2852,13 @@ async def lifespan(app: FastAPI):
     if _quality_source == "qualicache" and _cfg.QUALICACHE_URL:
         logger.info(f"Quality source: QualiCache at {_cfg.QUALICACHE_URL}")
     _configurator_html = _load_configurator_html()
+    _render_profile = _load_configured_render_profile()
+    if _render_profile is not None:
+        logger.info(
+            "Render profile loaded: %s (%s)",
+            _render_profile.name,
+            _render_profile.digest,
+        )
     load_languages()   # poster-output translations (English fallback if absent)
     _render_assets_signature = _compute_render_assets_signature()
     # Warm the genre fallback backgrounds into memory so no-art posters render
@@ -2782,7 +2989,24 @@ app.mount("/static", StaticFiles(directory=os.path.join(BASE_DIR, "static")), na
 
 
 @app.middleware("http")
-async def remove_server_header(request: Request, call_next):
+async def authenticate_and_harden(request: Request, call_next):
+    anonymous_path = (
+        request.url.path == "/health"
+        or request.url.path == "/static"
+        or request.url.path.startswith("/static/")
+    )
+    if not anonymous_path and _cfg.ACCESS_KEY:
+        header_key = request.headers.get("x-jellyfin-artwork-key", "")
+        query_key = request.query_params.get("access_key", "")
+        header_valid = _access_key_matches(header_key)
+        query_valid = (
+            not _cfg.HEADER_ONLY_AUTH
+            and _access_key_matches(query_key)
+        )
+        if not header_valid and not query_valid:
+            response = JSONResponse(status_code=403, content={"detail": "Unauthorized"})
+            response.headers["server"] = "unknown"
+            return response
     response = await call_next(request)
     response.headers["server"] = "unknown"
     return response
@@ -2794,8 +3018,6 @@ async def remove_server_header(request: Request, call_next):
 
 @app.get("/server-caps")
 async def server_caps(access_key: str = ""):
-    if _cfg.ACCESS_KEY and not hmac.compare_digest(access_key, _cfg.ACCESS_KEY):
-        raise HTTPException(status_code=403, detail="Unauthorized")
     next_refresh_hours = None
     if _cfg.TRENDING_FETCH_TIME:
         import zoneinfo
@@ -2910,6 +3132,31 @@ async def health_check():
     return {"status": "ok"}
 
 
+@app.get("/ready")
+async def readiness():
+    if _cfg.RENDER_PROFILE_PATH and _render_profile is None:
+        raise HTTPException(status_code=503, detail="Render profile is not loaded")
+    if _cfg.TEXTLESS_TEXT_DETECTION and not _text_detector_ready():
+        raise HTTPException(status_code=503, detail="Text detector is not ready")
+    return {
+        "status": "ready",
+        "renderer_revision": _cfg.SOURCE_REVISION,
+        "profile": (
+            {
+                "name": _render_profile.name,
+                "digest": _render_profile.digest,
+            }
+            if _render_profile is not None
+            else None
+        ),
+    }
+
+
+def _text_detector_ready() -> bool:
+    from text_detect import text_detection_ready
+    return text_detection_ready()
+
+
 @app.get("/stats")
 async def stats(access_key: str = ""):
     """
@@ -2917,9 +3164,6 @@ async def stats(access_key: str = ""):
     (in-flight renders, background quality fetches, MDBList key cooldowns).
     Gated behind the access key when one is configured.
     """
-    if _cfg.ACCESS_KEY and not hmac.compare_digest(access_key, _cfg.ACCESS_KEY):
-        raise HTTPException(status_code=403, detail="Unauthorized")
-
     now = asyncio.get_running_loop().time()
     keys = _cfg.SERVER_MDBLIST_KEYS
     mdblist_keys = []
@@ -2970,8 +3214,6 @@ async def debug_canvas(genre: str = "Action", title: str = "Sample Title",
     the usual rating label composited on top.  Lets you eyeball any genre/style
     without hunting for a title that happens to lack poster art.
     """
-    if _cfg.ACCESS_KEY and not hmac.compare_digest(access_key, _cfg.ACCESS_KEY):
-        raise HTTPException(status_code=403, detail="Unauthorized")
     if len(title) > 200:
         raise HTTPException(status_code=400, detail="Title too long")
     cache_key = (genre, title, style, year, score)
@@ -3011,8 +3253,6 @@ async def fallback_gallery(style: str = "minimal", access_key: str = ""):
     genre fonts at a glance and compare the minimal vs photoreal sets.  Gated
     behind the access key when configured.
     """
-    if _cfg.ACCESS_KEY and not hmac.compare_digest(access_key, _cfg.ACCESS_KEY):
-        raise HTTPException(status_code=403, detail="Unauthorized. Provide ?access_key=<key>")
     if style not in _GENRE_BG_STYLES:
         style = "minimal"
     _ak = f"&access_key={access_key}" if access_key else ""
@@ -3068,8 +3308,6 @@ async def fallback_gallery(style: str = "minimal", access_key: str = ""):
 
 @app.get("/", response_class=HTMLResponse)
 async def get_configurator(request: Request, access_key: str = "", reload: str = ""):
-    if _cfg.ACCESS_KEY and not hmac.compare_digest(access_key, _cfg.ACCESS_KEY):
-        raise HTTPException(status_code=403, detail="Unauthorized. Provide ?access_key=<key>")
     # ?reload=1 re-reads configurator.html from disk — useful while iterating on
     # the UI without restarting the container.  Gated on the access key so it's
     # not a public DoS vector via disk re-reads.
@@ -3110,8 +3348,6 @@ async def search_proxy(
     tmdb_key: str = "",
     access_key: str = "",
 ):
-    if _cfg.ACCESS_KEY and not hmac.compare_digest(access_key, _cfg.ACCESS_KEY):
-        raise HTTPException(status_code=403, detail="Unauthorized")
     if len(q) > 200:
         raise HTTPException(status_code=400, detail="Query too long")
 
@@ -3140,9 +3376,6 @@ async def resolve_imdb(
     tmdb_key: str = "",
     access_key: str = "",
 ):
-    if _cfg.ACCESS_KEY and not hmac.compare_digest(access_key, _cfg.ACCESS_KEY):
-        raise HTTPException(status_code=403, detail="Unauthorized")
-
     _check_tmdb_id(tmdb_id)
     _check_type(type)
 
@@ -3182,9 +3415,6 @@ async def get_logo(
     then falls through to TMDB and Metahub as needed.  No rendering is applied —
     callers receive the original PNG exactly as stored.
     """
-    if _cfg.ACCESS_KEY and not hmac.compare_digest(access_key, _cfg.ACCESS_KEY):
-        raise HTTPException(status_code=403, detail="Unauthorized")
-
     if _HTTP_CLIENT is None:
         raise HTTPException(status_code=503, detail="Service unavailable")
 
@@ -3226,8 +3456,7 @@ async def get_logo(
 # Poster endpoint
 # ---------------------------------------------------------------------------
 
-@app.get("/poster")
-async def get_poster(
+async def _render_poster(
     request: Request,
     tmdb_id: str = "",
     imdb_id: str = "",
@@ -3238,44 +3467,16 @@ async def get_poster(
     quality: str = "",
     season: int = 1,
     episode: int = 1,
-    access_key: str = "",
     mdblist_key: str = "",
     tmdb_key: str = "",
-    show_award_sash: str | None = None,
-    badge_display_mode: str | None = None,
-    show_quality_badges: str | None = None,
-    rating_display_mode: str | None = None,
-    accent_bar_font_size_ratio: str | None = None,
-    numeric_score_font_size_ratio: str | None = None,
-    accent_bar_y_offset: str | None = None,
-    numeric_score_y_offset: str | None = None,
-    minimalist_mode_font_size_ratio: str | None = None,
-    minimalist_mode_font_x_offset: str | None = None,
-    minimalist_mode_font_y_offset: str | None = None,
-    score_glow_threshold: str | None = None,
-    score_glow_blur: str | None = None,
-    score_glow_alpha: str | None = None,
-    logo_max_w_ratio: str | None = None,
-    logo_max_h_ratio: str | None = None,
-    logo_bottom_ratio: str | None = None,
-    badge_height: str | None = None,
-    badge_gap: str | None = None,
-    badge_anchor_x: str | None = None,
-    badge_anchor_y: str | None = None,
-    movie_weights: str | None = None,
-    tv_weights: str | None = None,
-    logo_language: str | None = None,
-    sash_priority: str | None = None,
-    muted: str | None = None,
-    textless: str | None = None,
-    score_color_mode: str | None = None,
     debug: str | None = None,
     nocache: str | None = None,
+    selected_image: _SelectedImage | None = None,
+    profile: RenderProfile | None = None,
+    output_format: str | None = None,
 ):
-    if _cfg.ACCESS_KEY and not hmac.compare_digest(access_key, _cfg.ACCESS_KEY):
-        raise HTTPException(status_code=403, detail="Unauthorized, your access key is not valid for this instance.")
-
     _check_type(type)
+    output_format = _resolve_output_format(output_format)
 
     # -----------------------------------------------------------------------
     # Anime-native ids (AniList / Kitsu).
@@ -3356,20 +3557,21 @@ async def get_poster(
             ),
         )
 
-    raw_params = {
-        k: v for k, v in request.query_params.items()
-        if k not in (
-            "tmdb_id", "imdb_id", "anilist_id", "kitsu_id", "stremio_id",
-            # Not art sources here (MAL needs auth, AniDB's API is heavily
-            # restricted), but AIOMetadata templates carry the full placeholder
-            # set. Excluded so their presence — substituted or not — can't
-            # fragment the composite cache key across otherwise identical
-            # requests.
-            "mal_id", "anidb_id",
-            "mdblist_key", "tmdb_key", "type",
-            "quality", "season", "episode", "access_key", "debug", "nocache",
-        )
-    }
+    raw_params = (
+        dict(profile.defaults)
+        if profile is not None
+        else {
+            k: v for k, v in request.query_params.items()
+            if k not in (
+                "tmdb_id", "imdb_id", "anilist_id", "kitsu_id", "stremio_id",
+                # These template placeholders are not art sources here, but
+                # their presence must not fragment otherwise identical caches.
+                "mal_id", "anidb_id",
+                "mdblist_key", "tmdb_key", "type",
+                "quality", "season", "episode", "access_key", "debug", "nocache",
+            )
+        }
+    )
     rcfg = build_request_config(raw_params)
 
     # Anime is essentially always Japanese, so the foreign-language slot says
@@ -3401,7 +3603,7 @@ async def get_poster(
     # all rendering parameters so different visual configs don't collide.
     # Skipped when an explicit quality= override is supplied (one-off).
     # ------------------------------------------------------------------
-    if not quality and not _cfg.DISABLE_COMPOSITE_CACHE:
+    if (selected_image is not None or not quality) and not _cfg.DISABLE_COMPOSITE_CACHE:
         # Server-side detection settings affect the rendered output but aren't URL
         # params, so fold a signature into the hash.  Toggling detection or
         # changing its thresholds then auto-busts stale composites (and leaves
@@ -3422,40 +3624,56 @@ async def get_poster(
             f"{int(rcfg.fallback_to_imdb)}"
         )
         _server_sig = "|server=" + _server_render_signature()
-        _params_hash = hashlib.sha256(
-            (
-                "&".join(f"{k}={v}" for k, v in sorted(raw_params.items()))
-                + _detect_sig
-                + _poster_selection_sig
-                + _rating_policy_sig
-                + _server_sig
-            ).encode()
-        ).hexdigest()[:16]
-        # The anime key has to be part of this: the same imdb/tmdb pair renders
-        # different art depending on whether an anime id came with it, so the
-        # two must not share a composite cache entry.
-        final_cache_key = (
-            f"{anime_key}:{imdb_id}:{tmdb_id}:{type}:{_params_hash}"
-            if is_anime
-            else f"{imdb_id}:{tmdb_id}:{type}:{_params_hash}"
+        _identity = (
+            "&".join(f"{k}={v}" for k, v in sorted(raw_params.items()))
+            + _detect_sig
+            + _poster_selection_sig
+            + _rating_policy_sig
+            + _server_sig
         )
-        cached_jpeg = None if _force_refresh else get_cached_final_poster(final_cache_key)
+        if selected_image is not None:
+            _identity = _selected_cache_identity(
+                base_identity=_identity,
+                selected_sha256=selected_image.sha256,
+                profile_digest=profile.digest if profile is not None else "",
+                renderer_revision=_cfg.SOURCE_REVISION,
+                imdb_id=imdb_id,
+                tmdb_id=tmdb_id,
+                media_type=type,
+                quality=quality,
+                season=season,
+                episode=episode,
+                output_format=output_format,
+            )
+        _hash_length = 32 if selected_image is not None else 16
+        _params_hash = hashlib.sha256(_identity.encode()).hexdigest()[:_hash_length]
+        if selected_image is not None:
+            final_cache_key = _selected_final_cache_key(
+                imdb_id,
+                tmdb_id,
+                type,
+                _params_hash,
+            )
+        elif is_anime:
+            # The same IMDb/TMDb pair can render different art when an anime
+            # provider ID is present, so preserve that identity in the cache.
+            final_cache_key = f"{anime_key}:{imdb_id}:{tmdb_id}:{type}:{_params_hash}"
+        else:
+            final_cache_key = f"{imdb_id}:{tmdb_id}:{type}:{_params_hash}"
+        client_cache_key = _client_cache_key(final_cache_key, selected_image)
+        cached_image = None if _force_refresh else get_cached_final_poster(final_cache_key)
         if _force_refresh:
             logger.info(f"Force refresh (nocache) for {final_cache_key} — bypassing cache read")
-        if cached_jpeg is not None:
+        if cached_image is not None:
             logger.info(f"Final poster cache hit for {final_cache_key}")
-            etag = f'"{final_cache_key}"'
-            if request.headers.get("if-none-match") == etag:
-                return Response(status_code=304)
-            _hit_resp = Response(content=cached_jpeg, media_type=f"image/{_cfg.IMAGE_FORMAT}")
-            _hit_resp.headers["ETag"] = etag
-            # This path is only reached when composite caching is enabled, so a
-            # no-store branch would be dead here — CDN TTL is the only option.
-            if _cfg.CDN_CACHE_TTL > 0:
-                _hit_resp.headers["Cache-Control"] = f"public, max-age={_cfg.CDN_CACHE_TTL}"
-            return _hit_resp
+            if client_cache_key is not None:
+                etag = f'"{client_cache_key}"'
+                if request.headers.get("if-none-match") == etag:
+                    return Response(status_code=304)
+            return _image_response(cached_image, output_format, client_cache_key)
     else:
         final_cache_key = None
+        client_cache_key = None
 
     # ------------------------------------------------------------------
     # Request coalescing: if another request in this worker is already
@@ -3469,13 +3687,11 @@ async def get_poster(
         if _existing_fut is not None:
             logger.info(f"Coalescing request for {final_cache_key}")
             try:
-                _coal_resp = Response(content=await _existing_fut, media_type=f"image/{_cfg.IMAGE_FORMAT}")
-                _coal_resp.headers["ETag"] = f'"{final_cache_key}"'
-                # Coalescing only happens when caching is on (final_cache_key set),
-                # so no-store can't apply here — CDN TTL only.
-                if _cfg.CDN_CACHE_TTL > 0:
-                    _coal_resp.headers["Cache-Control"] = f"public, max-age={_cfg.CDN_CACHE_TTL}"
-                return _coal_resp
+                return _image_response(
+                    await _existing_fut,
+                    output_format,
+                    client_cache_key,
+                )
             except Exception:
                 # The in-flight render failed; fall through and try ourselves.
                 pass
@@ -3777,7 +3993,13 @@ async def get_poster(
         # poster — OR, when no poster art exists at all, a genre-tinted canvas.
         #   poster missing entirely  → prefer backdrop over the canvas
         #   poster exists with text  → prefer backdrop over the text-burned poster
-        _use_backdrop = bool(backdrop_path) and (poster_path is None or not is_textless)
+        _use_backdrop = (
+            selected_image is None
+            and bool(backdrop_path)
+            and (poster_path is None or not is_textless)
+        )
+        if selected_image is not None:
+            is_textless = True
         if _use_backdrop:
             logger.info(f"No textless poster for {tmdb_id} — using backdrop crop as portrait fallback")
             is_textless = True          # backdrop is textless; enable logo compositing
@@ -3814,7 +4036,11 @@ async def get_poster(
             _orig_art = _p_default or next(iter(_ranked_posters), None)
         else:
             _orig_art = next(iter(_ranked_posters), None) or _p_default
-        _use_original_art = rcfg.use_original_art and bool(_orig_art)
+        _use_original_art = (
+            selected_image is None
+            and rcfg.use_original_art
+            and bool(_orig_art)
+        )
         if _use_original_art:
             poster_path   = _orig_art
             is_textless   = False
@@ -3916,7 +4142,7 @@ async def get_poster(
         _backdrop_rescued = False
         _detection_deferred = False
         _vc = tmdb_data.get("vote_count")
-        _vote_detection_ok = _detection_vote_ok(_vc)
+        _vote_detection_ok = selected_image is not None or _detection_vote_ok(_vc)
 
         async def _tvdb_is_clean(cand_image, art_id, *, source="backdrop", kind="bd") -> bool:
             """Inline burned-in-text vet for a TVDB candidate (background or poster),
@@ -3939,8 +4165,14 @@ async def get_poster(
                 logger.warning(f"TVDB {kind} vet failed for {tmdb_id}: {exc}")
                 return False
 
-        is_no_poster = poster_path is None and not _use_backdrop
-        if _use_backdrop:
+        is_no_poster = (
+            selected_image is None
+            and poster_path is None
+            and not _use_backdrop
+        )
+        if selected_image is not None:
+            _image_coro = _resolved(selected_image.image.copy())
+        elif _use_backdrop:
             # Text-aware backdrop cropping also invokes PP-OCR, so apply the
             # same foreground vote gate used by the final burned-in-text scan.
             _backdrop_avoid_text = (
@@ -4002,7 +4234,7 @@ async def get_poster(
             # we get a nicer image plus our own logo.  Gated to low-vote titles.
             _rescued = None
             _tbp = tmdb_data.get("text_backdrop_path")
-            if (_cfg.TEXTLESS_TEXT_DETECTION and not is_textless and _tbp
+            if (selected_image is None and _cfg.TEXTLESS_TEXT_DETECTION and not is_textless and _tbp
                     and not _use_original_art
                     and _detection_vote_ok(tmdb_data.get("vote_count"))):
                 try:
@@ -4096,7 +4328,11 @@ async def get_poster(
         if _scan_selected_image:
             from text_detect import DETECT_RES_SIG
 
-            if _use_backdrop:
+            if selected_image is not None:
+                _det_src = f"selected:{selected_image.sha256}"
+                _image_cache_key = _det_src
+                _det_source = "poster"
+            elif _use_backdrop:
                 _crop_variant = "ta" if _backdrop_avoid_text else "plain"
                 _det_src = f"bd:{backdrop_path}:{_CROP_VERSION}:{_crop_variant}"
                 _image_cache_key = (
@@ -4587,7 +4823,7 @@ async def get_poster(
                 )
                 _suppress_overlay = False
             elif _suppress_overlay is True:
-                if not _use_backdrop and poster_path:
+                if selected_image is None and not _use_backdrop and poster_path:
                     from textless_report import report_fake_textless_poster
                     report_fake_textless_poster(
                         media_type=type,
@@ -4612,7 +4848,7 @@ async def get_poster(
                 )
                 _suppress_overlay = False
 
-        # Offload CPU-bound PIL compositing + JPEG encoding to the thread pool
+        # Offload CPU-bound PIL compositing + image encoding to the thread pool
         # so the event loop stays free for concurrent requests.
         _bp_args = dict(
             logo=logo if (is_textless and not is_no_poster and not rcfg.textless
@@ -4631,10 +4867,7 @@ async def get_poster(
 
         def _composite_and_encode() -> bytes:
             result = build_poster(image, score, genre, rcfg, **_bp_args)
-            buf = io.BytesIO()
-            _quality = _cfg.WEBP_QUALITY if _cfg.IMAGE_FORMAT == "webp" else _cfg.JPEG_QUALITY
-            result.convert("RGB").save(buf, format=_cfg.IMAGE_FORMAT.upper(), quality=_quality)
-            return buf.getvalue()
+            return _encode_rendered_image(result, output_format)
 
         img_bytes = await asyncio.get_running_loop().run_in_executor(
             None, _composite_and_encode
@@ -4672,15 +4905,7 @@ async def get_poster(
         if _render_fut is not None:
             _render_fut.set_result(img_bytes)
 
-        response = Response(content=img_bytes, media_type=f"image/{_cfg.IMAGE_FORMAT}")
-        if final_cache_key is not None:
-            response.headers["ETag"] = f'"{final_cache_key}"'
-        if _cfg.DISABLE_COMPOSITE_CACHE:
-            response.headers["Cache-Control"] = "no-store, no-cache, must-revalidate"
-            response.headers["Pragma"] = "no-cache"
-        elif _cfg.CDN_CACHE_TTL > 0:
-            response.headers["Cache-Control"] = f"public, max-age={_cfg.CDN_CACHE_TTL}"
-        return response
+        return _image_response(img_bytes, output_format, client_cache_key)
 
     except ValueError as exc:
         if _render_fut is not None and not _render_fut.done():
@@ -4726,3 +4951,144 @@ async def get_poster(
             _rating_fetch_inflight.pop(imdb_id, None)
         if final_cache_key is not None:
             _render_inflight.pop(final_cache_key, None)
+
+
+@app.get("/poster")
+async def get_poster(
+    request: Request,
+    tmdb_id: str = "",
+    imdb_id: str = "",
+    anilist_id: str = "",
+    kitsu_id: str = "",
+    stremio_id: str = "",
+    type: str = "movie",
+    quality: str = "",
+    season: int = 1,
+    episode: int = 1,
+    access_key: str = "",
+    mdblist_key: str = "",
+    tmdb_key: str = "",
+    show_award_sash: str | None = None,
+    badge_display_mode: str | None = None,
+    show_quality_badges: str | None = None,
+    rating_display_mode: str | None = None,
+    accent_bar_font_size_ratio: str | None = None,
+    numeric_score_font_size_ratio: str | None = None,
+    accent_bar_y_offset: str | None = None,
+    numeric_score_y_offset: str | None = None,
+    minimalist_mode_font_size_ratio: str | None = None,
+    minimalist_mode_font_x_offset: str | None = None,
+    minimalist_mode_font_y_offset: str | None = None,
+    score_glow_threshold: str | None = None,
+    score_glow_blur: str | None = None,
+    score_glow_alpha: str | None = None,
+    logo_max_w_ratio: str | None = None,
+    logo_max_h_ratio: str | None = None,
+    logo_bottom_ratio: str | None = None,
+    badge_height: str | None = None,
+    badge_gap: str | None = None,
+    badge_anchor_x: str | None = None,
+    badge_anchor_y: str | None = None,
+    movie_weights: str | None = None,
+    tv_weights: str | None = None,
+    logo_language: str | None = None,
+    sash_priority: str | None = None,
+    muted: str | None = None,
+    textless: str | None = None,
+    score_color_mode: str | None = None,
+    debug: str | None = None,
+    nocache: str | None = None,
+):
+    return await _render_poster(
+        request=request,
+        tmdb_id=tmdb_id,
+        imdb_id=imdb_id,
+        anilist_id=anilist_id,
+        kitsu_id=kitsu_id,
+        stremio_id=stremio_id,
+        type=type,
+        quality=quality,
+        season=season,
+        episode=episode,
+        mdblist_key=mdblist_key,
+        tmdb_key=tmdb_key,
+        debug=debug,
+        nocache=nocache,
+    )
+
+
+@app.post("/render/selected")
+async def render_selected(
+    request: Request,
+    profile: str,
+    tmdb_id: str,
+    imdb_id: str,
+    type: str = "movie",
+    quality: str = "",
+    season: int = 1,
+    episode: int = 1,
+    output_format: str = "jpeg",
+):
+    _check_tmdb_id(tmdb_id)
+    _check_imdb_id(imdb_id)
+    _check_type(type)
+    normalized_output_format = output_format.lower()
+    if normalized_output_format not in _OUTPUT_FORMATS:
+        raise HTTPException(status_code=400, detail="Invalid output_format")
+    if season < 1 or episode < 1:
+        raise HTTPException(status_code=400, detail="season and episode must be positive")
+    if not _cfg.ACCESS_KEY:
+        raise HTTPException(
+            status_code=503,
+            detail="ACCESS_KEY must be configured for selected rendering",
+        )
+    header_key = request.headers.get("x-jellyfin-artwork-key", "")
+    if not _access_key_matches(header_key):
+        raise HTTPException(status_code=403, detail="Unauthorized")
+    render_profile = _render_profile
+    if render_profile is None:
+        raise HTTPException(status_code=503, detail="Render profile is not loaded")
+    if profile != render_profile.name:
+        raise HTTPException(status_code=404, detail="Unknown render profile")
+
+    allowed_query = {
+        "episode",
+        "imdb_id",
+        "output_format",
+        "profile",
+        "quality",
+        "season",
+        "tmdb_id",
+        "type",
+    }
+    unknown_query = sorted(set(request.query_params) - allowed_query)
+    if unknown_query:
+        raise HTTPException(
+            status_code=400,
+            detail=f"Unsupported query parameters: {', '.join(unknown_query)}",
+        )
+
+    body = await _read_selected_body(request)
+    selected_image = await asyncio.get_running_loop().run_in_executor(
+        None,
+        _decode_selected_image,
+        body,
+        request.headers.get("content-type", ""),
+    )
+    response = await _render_poster(
+        request=request,
+        tmdb_id=tmdb_id,
+        imdb_id=imdb_id,
+        type=type,
+        quality=quality,
+        season=season,
+        episode=episode,
+        selected_image=selected_image,
+        profile=render_profile,
+        output_format=normalized_output_format,
+    )
+    response.headers["X-Render-Profile-SHA256"] = render_profile.digest
+    response.headers["X-Renderer-Revision"] = _cfg.SOURCE_REVISION
+    response.headers["Cache-Control"] = "no-store"
+    response.headers["Pragma"] = "no-cache"
+    return response
