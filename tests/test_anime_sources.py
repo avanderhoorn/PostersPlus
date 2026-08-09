@@ -1,4 +1,5 @@
 import unittest
+from unittest.mock import AsyncMock, patch
 
 import anime
 import config
@@ -596,6 +597,24 @@ class LiteralPlaceholderToleranceTests(unittest.TestCase):
 
     def test_a_real_id_still_wins_beside_a_literal(self):
         self.assertEqual(self.resolve("{anilist_id?}", "7442"), ("kitsu", 7442))
+
+
+class PosterWrapperAnimeIdTests(unittest.IsolatedAsyncioTestCase):
+    async def test_wrapper_preserves_anime_native_ids(self):
+        import main
+
+        render = AsyncMock(return_value=object())
+        with patch.object(main, "_render_poster", render):
+            await main.get_poster(
+                request=object(),
+                anilist_id="16498",
+                kitsu_id="7442",
+                stremio_id="kitsu:7442",
+            )
+
+        self.assertEqual(render.await_args.kwargs["anilist_id"], "16498")
+        self.assertEqual(render.await_args.kwargs["kitsu_id"], "7442")
+        self.assertEqual(render.await_args.kwargs["stremio_id"], "kitsu:7442")
 
 
 class StremioIdTests(unittest.TestCase):

@@ -1,6 +1,7 @@
 import os
 import tempfile
 import unittest
+from unittest.mock import patch
 
 import cache
 import main
@@ -39,6 +40,23 @@ class RenderSignatureTests(unittest.TestCase):
             self.assertNotEqual(before, after)
         finally:
             main._cfg.JPEG_QUALITY = original
+
+
+class SelectedCacheInvalidationTests(unittest.TestCase):
+    def test_selected_key_preserves_invalidation_fields(self):
+        key = main._selected_final_cache_key("tt123", "456", "movie", "abc")
+        try:
+            with cache._composite_l1_lock:
+                cache._composite_l1[key] = b"poster"
+            with (
+                patch.object(cache, "COMPOSITE_MEM_ENTRIES", 1),
+                patch.object(cache, "get_db"),
+            ):
+                cache.invalidate_final_posters("456", "movie")
+            self.assertNotIn(key, cache._composite_l1)
+        finally:
+            with cache._composite_l1_lock:
+                cache._composite_l1.pop(key, None)
 
 
 if __name__ == "__main__":
