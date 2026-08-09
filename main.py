@@ -2200,10 +2200,17 @@ async def health_check():
     return {"status": "ok"}
 
 
+def _text_detector_ready() -> bool:
+    from text_detect import text_detection_ready
+    return text_detection_ready()
+
+
 @app.get("/ready")
 async def readiness():
     if _cfg.RENDER_PROFILE_PATH and _render_profile is None:
         raise HTTPException(status_code=503, detail="Render profile is not loaded")
+    if _cfg.TEXTLESS_TEXT_DETECTION and not _text_detector_ready():
+        raise HTTPException(status_code=503, detail="Text detector is not ready")
     return {
         "status": "ready",
         "renderer_revision": _cfg.SOURCE_REVISION,

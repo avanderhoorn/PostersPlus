@@ -42,8 +42,36 @@ _MODEL_PATH = os.environ.get("PPOCR_MODEL_PATH") or (
     else "/app/cache/ch_PP-OCRv5_det_mobile.onnx"
 )
 _RAPIDOCR_MODELS = importlib.resources.files("rapidocr").joinpath("models") if _HAS_RAPIDOCR else None
-_CLS_MODEL_PATH = str(_RAPIDOCR_MODELS.joinpath("ch_ppocr_mobile_v2.0_cls_infer.onnx")) if _RAPIDOCR_MODELS else ""
-_REC_MODEL_PATH = str(_RAPIDOCR_MODELS.joinpath("ch_PP-OCRv4_rec_infer.onnx")) if _RAPIDOCR_MODELS else ""
+
+
+def _find_bundled_model(models_path, keyword: str) -> str:
+    """Find a bundled RapidOCR model without depending on its versioned name."""
+    if models_path is None:
+        return ""
+    directory = os.fspath(models_path)
+    if not os.path.isdir(directory):
+        return ""
+    try:
+        matches = sorted(
+            os.path.join(directory, filename)
+            for filename in os.listdir(directory)
+            if filename.lower().endswith(".onnx")
+            and keyword in filename.lower()
+        )
+    except OSError as exc:
+        logger.warning("Could not scan rapidocr models dir %s: %s", directory, exc)
+        return ""
+    if not matches:
+        logger.warning(
+            "No bundled rapidocr model found for keyword %r in %s",
+            keyword,
+            directory,
+        )
+    return matches[0] if matches else ""
+
+
+_CLS_MODEL_PATH = _find_bundled_model(_RAPIDOCR_MODELS, "cls")
+_REC_MODEL_PATH = _find_bundled_model(_RAPIDOCR_MODELS, "rec")
 
 try:
     _BOX_THRESHOLD = float(os.environ.get("PPOCR_BOX_THRESHOLD", "0.70"))
@@ -110,6 +138,11 @@ def text_detection_available() -> bool:
     return _HAS_RAPIDOCR
 
 
+def text_detection_ready() -> bool:
+    """True only after the configured detector model loaded successfully."""
+    return _ocr_pool is not None
+
+
 def text_detection_status() -> str:
     """Compact runtime status suitable for startup and request logs."""
     if not _HAS_RAPIDOCR:
@@ -137,7 +170,7 @@ def _valid_model(path: str) -> bool:
 
 
 def _new_ocr_session():
-    return RapidOCR(params={
+    params = {
         "Global.use_cls": False,
         "Global.use_rec": False,
         "Global.log_level": "error",
@@ -145,14 +178,15 @@ def _new_ocr_session():
         "Det.limit_side_len": _LIMIT_SIDE_LEN,
         "Det.limit_type": "max",
         "Det.box_thresh": 0.3,
-        # RapidOCR initialises these engines even when disabled. Point it at
-        # the bundled read-only models rather than its writable aliases.
-        "Cls.model_path": _CLS_MODEL_PATH,
-        "Rec.model_path": _REC_MODEL_PATH,
         "EngineConfig.onnxruntime.intra_op_num_threads": _ORT_THREADS,
         "EngineConfig.onnxruntime.inter_op_num_threads": 1,
         "EngineConfig.onnxruntime.enable_cpu_mem_arena": True,
-    })
+    }
+    if _CLS_MODEL_PATH:
+        params["Cls.model_path"] = _CLS_MODEL_PATH
+    if _REC_MODEL_PATH:
+        params["Rec.model_path"] = _REC_MODEL_PATH
+    return RapidOCR(params=params)
 
 
 def _ensure_model():
