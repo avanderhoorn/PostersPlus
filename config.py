@@ -30,6 +30,10 @@ HEADER_ONLY_AUTH      = _parse_bool_env("HEADER_ONLY_AUTH", False)
 RENDER_PROFILE_PATH   = os.environ.get("RENDER_PROFILE_PATH", "").strip()
 SOURCE_REVISION       = os.environ.get("POSTERSPLUS_SOURCE_REVISION", "unknown").strip() or "unknown"
 SELECTED_MAX_BYTES    = max(1, int(os.environ.get("SELECTED_MAX_BYTES", str(10 * 1024 * 1024))))
+SELECTION_MAX_BYTES   = max(1, int(os.environ.get(
+    "SELECTION_MAX_BYTES",
+    str(2 * (4 * ((SELECTED_MAX_BYTES + 2) // 3)) + 4096),
+)))
 SELECTED_MAX_WIDTH    = max(1, int(os.environ.get("SELECTED_MAX_WIDTH", "8000")))
 SELECTED_MAX_HEIGHT   = max(1, int(os.environ.get("SELECTED_MAX_HEIGHT", "8000")))
 SELECTED_MAX_PIXELS   = max(1, int(os.environ.get("SELECTED_MAX_PIXELS", "20000000")))
