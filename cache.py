@@ -1541,14 +1541,15 @@ def get_cached_artwork_candidates(
 ) -> dict | None:
     """Return a fresh successful candidate response, or None."""
     try:
-        row = get_db().execute(
-            """
-            SELECT response_json, result_class, cached_at
-            FROM artwork_candidate_cache
-            WHERE cache_key = ?
-            """,
-            (cache_key,),
-        ).fetchone()
+        with _db_lock:
+            row = get_db().execute(
+                """
+                SELECT response_json, result_class, cached_at
+                FROM artwork_candidate_cache
+                WHERE cache_key = ?
+                """,
+                (cache_key,),
+            ).fetchone()
         if row is None:
             return None
         ttl = partial_ttl if row[1] == "partial" else complete_ttl
@@ -1567,14 +1568,23 @@ def set_cached_artwork_candidates(
     cache_key: str,
     response: dict,
     result_class: str,
-) -> None:
+    *,
+    deadline_monotonic: float | None = None,
+) -> bool | None:
     """Cache only complete, empty, or partial successful searches."""
     if result_class not in ("complete", "empty", "partial"):
         raise ValueError("invalid artwork-candidate result class")
     payload = json.dumps(response, sort_keys=True, separators=(",", ":"))
+    cached_at = int(time.time())
     try:
         with _db_lock:
-            get_db().execute(
+            if (
+                deadline_monotonic is not None
+                and time.monotonic() >= deadline_monotonic
+            ):
+                return False
+            db = get_db()
+            db.execute(
                 """
                 INSERT INTO artwork_candidate_cache
                     (cache_key, response_json, result_class, cached_at)
@@ -1583,12 +1593,36 @@ def set_cached_artwork_candidates(
                     response_json=excluded.response_json,
                     result_class=excluded.result_class,
                     cached_at=excluded.cached_at
+                WHERE excluded.result_class != 'partial'
+                   OR artwork_candidate_cache.result_class = 'partial'
+                   OR artwork_candidate_cache.cached_at < excluded.cached_at - 86400
                 """,
-                (cache_key, payload, result_class, int(time.time())),
+                (cache_key, payload, result_class, cached_at),
             )
-            get_db().commit()
+            if (
+                deadline_monotonic is not None
+                and time.monotonic() >= deadline_monotonic
+            ):
+                db.rollback()
+                return False
+            db.commit()
+            if (
+                deadline_monotonic is not None
+                and time.monotonic() >= deadline_monotonic
+            ):
+                db.execute(
+                    """
+                    DELETE FROM artwork_candidate_cache
+                    WHERE cache_key = ? AND response_json = ? AND result_class = ?
+                    """,
+                    (cache_key, payload, result_class),
+                )
+                db.commit()
+                return False
+            return True
     except Exception as exc:
         logger.error(f"Artwork-candidate cache write error: {exc}")
+        return None
 
 
 # ---------------------------------------------------------------------------

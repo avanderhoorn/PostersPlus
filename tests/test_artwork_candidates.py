@@ -1,8 +1,11 @@
 import asyncio
+import gzip
 import io
 import json
 import logging
 import sqlite3
+import threading
+import time
 import unittest
 from unittest.mock import AsyncMock, Mock, patch
 
@@ -27,9 +30,10 @@ def _image_bytes(
 
 
 def _json_response(payload, status=200, headers=None):
+    body = json.dumps(payload).encode()
     return httpx.Response(
         status,
-        json=payload,
+        stream=httpx.ByteStream(body),
         headers={"Content-Type": "application/json", **(headers or {})},
     )
 
@@ -113,6 +117,7 @@ class StrictSchemaTests(unittest.TestCase):
             b'{"schema_version":1,"type":"movie","tmdb_id":"01","imdb_id":"tt1"}',
             b'{"schema_version":1,"type":"movie","tmdb_id":"123","imdb_id":"123"}',
             b'{"schema_version":1,"type":"movie","tmdb_id":"123","imdb_id":123}',
+            b'{"schema_version":1,"type":"movie","tmdb_id":"123","tvdb_id":"456"}',
             b'{"schema_version":1,"type":"series","tmdb_id":"123","imdb_id":"tt1","tvdb_id":"x"}',
             b'[]',
             b'not-json',
@@ -121,6 +126,16 @@ class StrictSchemaTests(unittest.TestCase):
             with self.subTest(body=body):
                 with self.assertRaises(candidates.CandidateDiscoveryError):
                     candidates.decode_request_body(body)
+
+    def test_movie_rejects_non_null_tvdb_identity(self):
+        with self.assertRaises(candidates.CandidateDiscoveryError) as raised:
+            candidates.decode_request_body(json.dumps({
+                "schema_version": 1,
+                "type": "movie",
+                "tmdb_id": "123",
+                "tvdb_id": "456",
+            }).encode())
+        self.assertEqual(raised.exception.code, "invalid_tvdb_id")
 
 
 class UrlPolicyTests(unittest.TestCase):
@@ -392,7 +407,31 @@ class ImageAndOcrTests(unittest.IsolatedAsyncioTestCase):
             return httpx.Response(302, headers={"Location": "https://evil.example/x"})
 
         async with httpx.AsyncClient(transport=httpx.MockTransport(redirect)) as client:
-            with self.assertRaises(candidates._CandidateRejected):
+            with self.assertRaises(candidates._ScreeningFailure):
+                await candidates._fetch_screening_image(
+                    client,
+                    candidate,
+                    _settings(),
+                )
+
+        async def bad_status(_request):
+            return httpx.Response(503)
+
+        async with httpx.AsyncClient(transport=httpx.MockTransport(bad_status)) as client:
+            with self.assertRaises(candidates._ScreeningFailure):
+                await candidates._fetch_screening_image(
+                    client,
+                    candidate,
+                    _settings(),
+                )
+
+        async def transport_failure(request):
+            raise httpx.ConnectError("unavailable", request=request)
+
+        async with httpx.AsyncClient(
+            transport=httpx.MockTransport(transport_failure)
+        ) as client:
+            with self.assertRaises(candidates._ScreeningFailure):
                 await candidates._fetch_screening_image(
                     client,
                     candidate,
@@ -404,7 +443,7 @@ class ImageAndOcrTests(unittest.IsolatedAsyncioTestCase):
         async def too_large(_request):
             return httpx.Response(
                 200,
-                content=body,
+                stream=httpx.ByteStream(body),
                 headers={
                     "Content-Type": "image/jpeg",
                     "Content-Length": str(len(body)),
@@ -418,6 +457,30 @@ class ImageAndOcrTests(unittest.IsolatedAsyncioTestCase):
                     candidate,
                     _settings(max_image_bytes=len(body) - 1),
                 )
+
+    async def test_content_encoding_is_rejected_before_decompression(self):
+        compressed = gzip.compress(_image_bytes())
+
+        async def handler(_request):
+            return httpx.Response(
+                200,
+                stream=httpx.ByteStream(compressed),
+                headers={
+                    "Content-Type": "image/jpeg",
+                    "Content-Encoding": "gzip",
+                    "Content-Length": str(len(compressed)),
+                },
+            )
+
+        async with httpx.AsyncClient(transport=httpx.MockTransport(handler)) as client:
+            with self.assertRaises(candidates._SourceFailure) as raised:
+                await candidates._bounded_response_bytes(
+                    client,
+                    "https://image.tmdb.org/t/p/original/a.jpg",
+                    params=None,
+                    max_bytes=len(compressed) + 1,
+                )
+        self.assertEqual(raised.exception.reason, "content_encoding")
 
     async def test_ocr_positive_is_rejected_and_unavailable_is_fail_closed(self):
         image = Image.new("RGBA", (600, 900), "black")
@@ -434,6 +497,7 @@ class ImageAndOcrTests(unittest.IsolatedAsyncioTestCase):
                     digest,
                     ("Title",),
                     _settings(),
+                    {},
                 )
             )
             cache_write.assert_called_once()
@@ -448,13 +512,56 @@ class ImageAndOcrTests(unittest.IsolatedAsyncioTestCase):
                     digest,
                     ("Title",),
                     _settings(),
+                    {},
                 )
         image.close()
+
+    def test_ocr_cache_key_includes_normalized_title_identity(self):
+        first = candidates._ocr_cache_key(
+            "a" * 64,
+            ("  The   TITLE ", "Original"),
+            _settings(),
+        )
+        equivalent = candidates._ocr_cache_key(
+            "a" * 64,
+            ("original", "the title"),
+            _settings(),
+        )
+        different = candidates._ocr_cache_key(
+            "a" * 64,
+            ("Different Title",),
+            _settings(),
+        )
+        self.assertEqual(first, equivalent)
+        self.assertNotEqual(first, different)
+        self.assertIn(candidates.OCR_TITLE_POLICY_REVISION, first)
+
+    def test_ocr_worker_has_no_queue_and_shutdown_does_not_join_active_call(self):
+        worker = candidates._SingleOcrWorker()
+        release = threading.Event()
+        started = threading.Event()
+
+        def blocking():
+            started.set()
+            release.wait(2)
+            return False
+
+        future = worker.submit(blocking)
+        self.assertTrue(started.wait(1))
+        with self.assertRaises(candidates._DetectionUnavailable):
+            worker.submit(lambda: False)
+        before = time.monotonic()
+        worker.shutdown()
+        self.assertLess(time.monotonic() - before, 0.1)
+        release.set()
+        self.assertFalse(future.result(timeout=1))
 
 
 class DiscoveryPipelineTests(unittest.IsolatedAsyncioTestCase):
     def setUp(self):
         candidates._search_admission.reset_for_tests()
+        candidates._candidate_inflight.clear()
+        candidates._ocr_worker.reset_for_tests()
 
     async def _discover_with_patches(
         self,
@@ -600,16 +707,18 @@ class DiscoveryPipelineTests(unittest.IsolatedAsyncioTestCase):
         ):
             seen = set()
             work = {"ocr": 0}
-            first = await candidates._screen_source(
+            first, first_reliable = await candidates._screen_source(
                 Mock(), [items[0]], titles=("Title",), settings=_settings(),
                 seen_digests=seen, work=work,
             )
-            second = await candidates._screen_source(
+            second, second_reliable = await candidates._screen_source(
                 Mock(), [items[1]], titles=("Title",), settings=_settings(),
                 seen_digests=seen, work=work,
             )
         self.assertEqual(len(first), 1)
         self.assertEqual(second, [])
+        self.assertTrue(first_reliable)
+        self.assertTrue(second_reliable)
         self.assertEqual(work["ocr"], 1)
 
     async def test_no_clean_art_returns_200_empty_without_fallback(self):
@@ -684,6 +793,284 @@ class DiscoveryPipelineTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(response["sources"]["fanart"], "failed")
         self.assertEqual(outcome, "partial")
         self.assertEqual(cache_write.call_args.args[2], "partial")
+
+    async def test_transient_screening_failure_discards_unreliable_source(self):
+        tmdb_items = [
+            candidates.SourceCandidate(
+                "tmdb",
+                f"https://image.tmdb.org/t/p/original/tmdb-{index}.jpg",
+                600,
+                900,
+                None,
+            )
+            for index in range(2)
+        ]
+        fanart_item = candidates.SourceCandidate(
+            "fanart",
+            "https://assets.fanart.tv/fanart/tv/456/tvposter/fanart.jpg",
+            600,
+            900,
+            None,
+        )
+
+        async def fetch(_client, item, _settings):
+            if item.source == "tmdb" and item.url.endswith("tmdb-1.jpg"):
+                raise candidates._ScreeningFailure()
+            return (
+                b"shared-clean",
+                Image.new("RGBA", (600, 900), "black"),
+                600,
+                900,
+            )
+
+        with (
+            patch.object(
+                candidates,
+                "_fetch_identity",
+                AsyncMock(return_value=candidates._Identity(("Title",), True)),
+            ),
+            patch.object(candidates, "_tmdb_candidates", AsyncMock(return_value=tmdb_items)),
+            patch.object(candidates, "_fanart_candidates", AsyncMock(return_value=[fanart_item])),
+            patch.object(candidates, "_fetch_screening_image", side_effect=fetch),
+            patch.object(candidates, "_ocr_has_text", AsyncMock(return_value=False)),
+            patch.object(candidates, "get_cached_artwork_candidates", return_value=None),
+            patch.object(candidates, "set_cached_artwork_candidates", return_value=True) as cache_write,
+            patch.object(candidates, "text_detection_ready", return_value=True),
+        ):
+            response, outcome = await candidates.discover_candidates(
+                Mock(),
+                _request("series", "456"),
+                settings=_settings(),
+            )
+        self.assertEqual(
+            response["sources"],
+            {"tmdb": "failed", "fanart": "ready"},
+        )
+        self.assertEqual(
+            [item["source"] for item in response["candidates"]],
+            ["fanart"],
+        )
+        self.assertEqual(outcome, "partial")
+        self.assertEqual(cache_write.call_args.args[2], "partial")
+
+    async def test_all_screening_transport_failures_return_uncached_503(self):
+        item = candidates.SourceCandidate(
+            "tmdb",
+            "https://image.tmdb.org/t/p/original/tmdb.jpg",
+            600,
+            900,
+            None,
+        )
+        with (
+            patch.object(
+                candidates,
+                "_fetch_identity",
+                AsyncMock(return_value=candidates._Identity(("Title",), False)),
+            ),
+            patch.object(candidates, "_tmdb_candidates", AsyncMock(return_value=[item])),
+            patch.object(
+                candidates,
+                "_fetch_screening_image",
+                AsyncMock(side_effect=candidates._ScreeningFailure()),
+            ),
+            patch.object(candidates, "get_cached_artwork_candidates", return_value=None),
+            patch.object(candidates, "set_cached_artwork_candidates") as cache_write,
+            patch.object(candidates, "text_detection_ready", return_value=True),
+        ):
+            with self.assertRaises(candidates.CandidateDiscoveryError) as raised:
+                await candidates.discover_candidates(
+                    Mock(),
+                    _request(imdb_id=None),
+                    settings=_settings(
+                        fanart_project_api_key="",
+                        fanart_client_key="",
+                    ),
+                )
+        self.assertEqual(raised.exception.code, "all_sources_failed")
+        cache_write.assert_not_called()
+
+    async def test_same_key_searches_coalesce_before_cache_write(self):
+        started = asyncio.Event()
+        release = asyncio.Event()
+        item = candidates.SourceCandidate(
+            "tmdb",
+            "https://image.tmdb.org/t/p/original/clean.jpg",
+            600,
+            900,
+            None,
+        )
+
+        async def identity(*_args):
+            started.set()
+            await release.wait()
+            return candidates._Identity(("Title",), True)
+
+        with (
+            patch.object(candidates, "_fetch_identity", side_effect=identity) as identity_mock,
+            patch.object(candidates, "_tmdb_candidates", AsyncMock(return_value=[item])),
+            patch.object(candidates, "_fanart_candidates", AsyncMock(return_value=[])),
+            patch.object(
+                candidates,
+                "_fetch_screening_image",
+                AsyncMock(return_value=(
+                    b"clean",
+                    Image.new("RGBA", (600, 900), "black"),
+                    600,
+                    900,
+                )),
+            ),
+            patch.object(candidates, "_ocr_has_text", AsyncMock(return_value=False)),
+            patch.object(candidates, "get_cached_artwork_candidates", return_value=None),
+            patch.object(candidates, "set_cached_artwork_candidates", return_value=True) as cache_write,
+            patch.object(candidates, "text_detection_ready", return_value=True),
+        ):
+            first = asyncio.create_task(
+                candidates.discover_candidates(Mock(), _request("series", "456"), settings=_settings())
+            )
+            await started.wait()
+            second = asyncio.create_task(
+                candidates.discover_candidates(Mock(), _request("series", "456"), settings=_settings())
+            )
+            await asyncio.sleep(0)
+            self.assertEqual(identity_mock.await_count, 1)
+            release.set()
+            first_result, second_result = await asyncio.gather(first, second)
+        self.assertEqual(first_result, second_result)
+        self.assertEqual(cache_write.call_count, 1)
+        self.assertEqual(cache_write.call_args.args[2], "complete")
+        self.assertEqual(candidates._search_admission.active, 0)
+
+    async def test_cache_io_runs_off_loop_and_deadline_cannot_return_success(self):
+        loop_thread = threading.get_ident()
+        cache_threads = []
+
+        def cache_read(*_args, **_kwargs):
+            cache_threads.append(threading.get_ident())
+            return None
+
+        def cache_write(*_args, **_kwargs):
+            cache_threads.append(threading.get_ident())
+            return True
+
+        with (
+            patch.object(
+                candidates,
+                "_fetch_identity",
+                AsyncMock(return_value=candidates._Identity(("Title",), True)),
+            ),
+            patch.object(candidates, "_tmdb_candidates", AsyncMock(return_value=[])),
+            patch.object(candidates, "_fanart_candidates", AsyncMock(return_value=[])),
+            patch.object(candidates, "get_cached_artwork_candidates", side_effect=cache_read),
+            patch.object(candidates, "set_cached_artwork_candidates", side_effect=cache_write),
+            patch.object(candidates, "text_detection_ready", return_value=True),
+        ):
+            await candidates.discover_candidates(
+                Mock(),
+                _request("series", "456"),
+                settings=_settings(),
+            )
+        self.assertEqual(len(cache_threads), 2)
+        self.assertTrue(all(thread_id != loop_thread for thread_id in cache_threads))
+
+        def slow_cache_write(*_args, **_kwargs):
+            time.sleep(0.05)
+            return True
+
+        with (
+            patch.object(candidates, "SEARCH_DEADLINE_SECONDS", 0.005),
+            patch.object(
+                candidates,
+                "_fetch_identity",
+                AsyncMock(return_value=candidates._Identity(("Title",), True)),
+            ),
+            patch.object(candidates, "_tmdb_candidates", AsyncMock(return_value=[])),
+            patch.object(candidates, "_fanart_candidates", AsyncMock(return_value=[])),
+            patch.object(candidates, "get_cached_artwork_candidates", return_value=None),
+            patch.object(candidates, "set_cached_artwork_candidates", side_effect=slow_cache_write),
+            patch.object(candidates, "text_detection_ready", return_value=True),
+        ):
+            with self.assertRaises(candidates.CandidateDiscoveryError) as raised:
+                await candidates.discover_candidates(
+                    Mock(),
+                    candidates.CandidateRequest("series", "999", None, "456"),
+                    settings=_settings(),
+                )
+        self.assertEqual(raised.exception.code, "deadline_exceeded")
+        await asyncio.sleep(0.06)
+
+    async def test_timed_out_ocr_holds_admission_and_rejects_new_scan(self):
+        release = threading.Event()
+        started = threading.Event()
+        item = candidates.SourceCandidate(
+            "tmdb",
+            "https://image.tmdb.org/t/p/original/clean.jpg",
+            600,
+            900,
+            None,
+        )
+
+        def blocking_ocr(*_args, **_kwargs):
+            started.set()
+            release.wait(2)
+            return False
+
+        async def fetch(*_args):
+            return (
+                b"clean",
+                Image.new("RGBA", (600, 900), "black"),
+                600,
+                900,
+            )
+
+        with (
+            patch.object(candidates, "SEARCH_DEADLINE_SECONDS", 0.02),
+            patch.object(
+                candidates,
+                "_fetch_identity",
+                AsyncMock(return_value=candidates._Identity(("Title",), False)),
+            ) as identity,
+            patch.object(candidates, "_tmdb_candidates", AsyncMock(return_value=[item])),
+            patch.object(candidates, "_fetch_screening_image", side_effect=fetch),
+            patch.object(candidates, "get_cached_artwork_candidates", return_value=None),
+            patch.object(candidates, "set_cached_artwork_candidates", return_value=True),
+            patch.object(candidates, "get_cached_text_detection", return_value=None),
+            patch.object(candidates, "set_cached_text_detection"),
+            patch.object(candidates, "text_detection_ready", return_value=True),
+            patch.object(candidates, "poster_has_burned_in_text", side_effect=blocking_ocr) as ocr,
+        ):
+            with self.assertRaises(candidates.CandidateDiscoveryError) as first:
+                await candidates.discover_candidates(
+                    Mock(),
+                    _request(imdb_id=None),
+                    settings=_settings(
+                        fanart_project_api_key="",
+                        fanart_client_key="",
+                    ),
+                )
+            self.assertEqual(first.exception.code, "deadline_exceeded")
+            self.assertTrue(started.is_set())
+            self.assertEqual(candidates._search_admission.active, 1)
+
+            with self.assertRaises(candidates.CandidateDiscoveryError) as second:
+                await candidates.discover_candidates(
+                    Mock(),
+                    candidates.CandidateRequest("movie", "999", None, None),
+                    settings=_settings(
+                        fanart_project_api_key="",
+                        fanart_client_key="",
+                    ),
+                )
+            self.assertEqual(second.exception.code, "text_detection_unavailable")
+            self.assertEqual(ocr.call_count, 1)
+            self.assertEqual(identity.await_count, 1)
+            self.assertEqual(candidates._search_admission.active, 1)
+
+            release.set()
+            for _ in range(100):
+                if candidates._search_admission.active == 0:
+                    break
+                await asyncio.sleep(0.01)
+        self.assertEqual(candidates._search_admission.active, 0)
 
     async def test_unavailable_fanart_contract_reports_failed(self):
         with (
@@ -790,7 +1177,7 @@ class DiscoveryPipelineTests(unittest.IsolatedAsyncioTestCase):
             patch.object(candidates, "_ocr_has_text", ocr),
         ):
             work = {"ocr": 0}
-            result = await candidates._screen_source(
+            result, reliable = await candidates._screen_source(
                 Mock(),
                 values,
                 titles=("Title",),
@@ -799,6 +1186,7 @@ class DiscoveryPipelineTests(unittest.IsolatedAsyncioTestCase):
                 work=work,
             )
         self.assertEqual(result, [])
+        self.assertTrue(reliable)
         self.assertEqual(work["ocr"], candidates.MAX_OCR_ATTEMPTS)
         self.assertEqual(ocr.await_count, candidates.MAX_OCR_ATTEMPTS)
 
@@ -951,6 +1339,56 @@ class CandidateCacheTests(unittest.TestCase):
         with self.assertRaises(ValueError):
             cache.set_cached_artwork_candidates("failure", {}, "failed")
 
+    def test_candidate_cache_write_rolls_back_after_deadline(self):
+        response = {
+            "schema_version": 1,
+            "sources": {"tmdb": "ready", "fanart": "failed"},
+            "candidates": [],
+        }
+        with (
+            patch.object(cache, "get_db", return_value=self.connection),
+            patch.object(cache.time, "monotonic", side_effect=[0.0, 2.0]),
+        ):
+            written = cache.set_cached_artwork_candidates(
+                "late",
+                response,
+                "partial",
+                deadline_monotonic=1.0,
+            )
+        self.assertFalse(written)
+        self.assertIsNone(
+            self.connection.execute(
+                "SELECT cache_key FROM artwork_candidate_cache WHERE cache_key = 'late'"
+            ).fetchone()
+        )
+
+    def test_partial_write_cannot_overwrite_fresh_complete_result(self):
+        complete = {
+            "schema_version": 1,
+            "sources": {"tmdb": "ready", "fanart": "ready"},
+            "candidates": [],
+        }
+        partial = {
+            "schema_version": 1,
+            "sources": {"tmdb": "ready", "fanart": "failed"},
+            "candidates": [],
+        }
+        with (
+            patch.object(cache, "get_db", return_value=self.connection),
+            patch.object(cache.time, "time", side_effect=[1000, 1001]),
+        ):
+            cache.set_cached_artwork_candidates("same", complete, "complete")
+            cache.set_cached_artwork_candidates("same", partial, "partial")
+        row = self.connection.execute(
+            """
+            SELECT response_json, result_class
+            FROM artwork_candidate_cache
+            WHERE cache_key = 'same'
+            """
+        ).fetchone()
+        self.assertEqual(json.loads(row[0]), complete)
+        self.assertEqual(row[1], "complete")
+
 
 class EndpointContractTests(unittest.IsolatedAsyncioTestCase):
     async def _post(self, headers=None, params="", body=None):
@@ -1055,6 +1493,53 @@ class EndpointContractTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(render_key.status_code, 403)
         self.assertEqual(query_key.status_code, 403)
         self.assertEqual(render_route.status_code, 403)
+
+    async def test_discovery_auth_is_enforced_with_asgi_root_path(self):
+        success = {
+            "schema_version": 1,
+            "sources": {"tmdb": "ready", "fanart": "failed"},
+            "candidates": [],
+        }
+        with (
+            patch.object(main._cfg, "JELLYFIN_ARTWORK_DISCOVERY_KEY", "discover"),
+            patch.object(main._cfg, "ACCESS_KEY", "render"),
+            patch.object(main, "_HTTP_CLIENT", Mock()),
+            patch.object(
+                main,
+                "discover_candidates",
+                AsyncMock(return_value=(success, "partial")),
+            ),
+        ):
+            transport = httpx.ASGITransport(
+                app=main.app,
+                root_path="/mounted",
+            )
+            async with httpx.AsyncClient(
+                transport=transport,
+                base_url="http://test/mounted",
+            ) as client:
+                denied = await client.post(
+                    "/v1/artwork/candidates",
+                    json={
+                        "schema_version": 1,
+                        "type": "movie",
+                        "tmdb_id": "123",
+                    },
+                )
+                allowed = await client.post(
+                    "/v1/artwork/candidates",
+                    json={
+                        "schema_version": 1,
+                        "type": "movie",
+                        "tmdb_id": "123",
+                    },
+                    headers={
+                        "X-Jellyfin-Artwork-Discovery-Key": "discover",
+                    },
+                )
+        self.assertEqual(denied.status_code, 403)
+        self.assertEqual(allowed.status_code, 200)
+        self.assertEqual(allowed.headers["cache-control"], "no-store")
 
     async def test_discovery_secret_must_not_equal_render_secret(self):
         with (

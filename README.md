@@ -380,7 +380,9 @@ curl --fail-with-body \
 The exact schema requires `schema_version: 1`, `type` (`movie` or `series`),
 and a string `tmdb_id`. `imdb_id` and `tvdb_id` may each be omitted or set to
 `null`; when non-null they must be valid strings and are cross-checked against
-TMDb. PostersPlus queries TMDb and optionally Fanart.tv, screens bounded
+TMDb. A non-null `tvdb_id` is accepted only for `series`; Movies reject it
+because TMDb movie external IDs do not provide a verified TVDB mapping.
+PostersPlus queries TMDb and optionally Fanart.tv, screens bounded
 portrait bytes with one OCR worker, deduplicates exact bytes, alternates
 source-ranked results, and returns at most eight credential-free HTTPS URLs
 from `image.tmdb.org` or `assets.fanart.tv`. Series Fanart results require a
@@ -393,6 +395,18 @@ Successful complete or empty searches cache for 24 hours; partial-source
 results cache for 15 minutes. Detection uncertainty, deadline failures, and
 all-source failures return 503 and are not cached. Every response uses
 `Cache-Control: no-store`; there is no title-bearing fallback.
+
+Candidate OCR has one non-queuing worker slot. A native OCR call cannot be
+killed safely after it starts; if the 20-second request deadline expires, its
+search admission and worker slot remain occupied until that call returns, and
+new scans fail rather than queue copied images. The worker is daemonized so
+shutdown never waits indefinitely for an unkillable native call.
+
+CDN redirects, transport/status failures, and encoded responses make that
+source unreliable rather than clean-empty. Results from another reliably
+screened source may return as a 15-minute partial result; no reliable source
+returns 503. Image bytes are read raw under the configured byte limit before
+decoding.
 
 ### Private selected-image renderer
 

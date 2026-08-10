@@ -8,10 +8,12 @@ import io
 import ipaddress
 import json
 import re
+import threading
 import time
+import unicodedata
 import warnings
 from collections import deque
-from concurrent.futures import ThreadPoolExecutor
+from concurrent.futures import Future
 from dataclasses import dataclass, replace
 from typing import Any
 from urllib.parse import urlsplit
@@ -41,6 +43,7 @@ METADATA_MAX_BYTES = 2 * 1024 * 1024
 MIN_PORTRAIT_ASPECT = 0.55
 MAX_PORTRAIT_ASPECT = 0.80
 OCR_POLICY_REVISION = "clean-primary-v1"
+OCR_TITLE_POLICY_REVISION = "normalized-titles-v1"
 RANKING_REVISION = "source-alternation-v1"
 RESULT_CACHE_TTL_SECONDS = 24 * 60 * 60
 PARTIAL_CACHE_TTL_SECONDS = 15 * 60
@@ -72,6 +75,10 @@ class _SourceFailure(Exception):
 
 
 class _CandidateRejected(Exception):
+    pass
+
+
+class _ScreeningFailure(Exception):
     pass
 
 
@@ -147,18 +154,13 @@ class DiscoverySettings:
 
 class _SearchAdmission:
     def __init__(self) -> None:
-        self._lock: asyncio.Lock | None = None
+        self._lock = threading.Lock()
         self._active = 0
         self._starts: deque[float] = deque()
 
-    def _get_lock(self) -> asyncio.Lock:
-        if self._lock is None:
-            self._lock = asyncio.Lock()
-        return self._lock
-
     async def start(self, now: float | None = None) -> str | None:
         current = time.monotonic() if now is None else now
-        async with self._get_lock():
+        with self._lock:
             while self._starts and current - self._starts[0] >= 60.0:
                 self._starts.popleft()
             if len(self._starts) >= MAX_SEARCH_STARTS_PER_MINUTE:
@@ -170,34 +172,88 @@ class _SearchAdmission:
             return None
 
     async def finish(self) -> None:
-        async with self._get_lock():
+        self.finish_from_worker()
+
+    def finish_from_worker(self) -> None:
+        with self._lock:
             self._active = max(0, self._active - 1)
 
+    @property
+    def active(self) -> int:
+        with self._lock:
+            return self._active
+
     def reset_for_tests(self) -> None:
-        self._lock = None
-        self._active = 0
-        self._starts.clear()
+        with self._lock:
+            self._active = 0
+            self._starts.clear()
+
+
+class _SingleOcrWorker:
+    """One daemon OCR slot with no pending-work queue."""
+
+    def __init__(self) -> None:
+        self._lock = threading.Lock()
+        self._active: Future | None = None
+        self._closed = False
+
+    def submit(self, fn) -> Future:
+        with self._lock:
+            if self._closed:
+                raise _DetectionUnavailable()
+            if self._active is not None and not self._active.done():
+                raise _DetectionUnavailable()
+            future: Future = Future()
+            self._active = future
+
+        def _run() -> None:
+            try:
+                result = fn()
+            except BaseException as exc:
+                with self._lock:
+                    if self._active is future:
+                        self._active = None
+                future.set_exception(exc)
+            else:
+                with self._lock:
+                    if self._active is future:
+                        self._active = None
+                future.set_result(result)
+
+        threading.Thread(
+            target=_run,
+            name="candidate-ocr",
+            daemon=True,
+        ).start()
+        return future
+
+    @property
+    def active_future(self) -> Future | None:
+        with self._lock:
+            return self._active
+
+    def shutdown(self) -> None:
+        # Python cannot kill an active native OCR call. The worker is daemonized
+        # so process shutdown never waits for it, while the occupied slot remains
+        # unavailable until the call actually returns.
+        with self._lock:
+            self._closed = True
+
+    def reset_for_tests(self) -> None:
+        with self._lock:
+            if self._active is not None and not self._active.done():
+                raise RuntimeError("cannot reset an active OCR worker")
+            self._active = None
+            self._closed = False
 
 
 _search_admission = _SearchAdmission()
-_ocr_executor: ThreadPoolExecutor | None = None
-
-
-def _get_ocr_executor() -> ThreadPoolExecutor:
-    global _ocr_executor
-    if _ocr_executor is None:
-        _ocr_executor = ThreadPoolExecutor(
-            max_workers=1,
-            thread_name_prefix="candidate-ocr",
-        )
-    return _ocr_executor
+_ocr_worker = _SingleOcrWorker()
+_candidate_inflight: dict[str, "asyncio.Task[tuple[dict[str, Any], str]]"] = {}
 
 
 def shutdown_candidate_ocr_executor() -> None:
-    global _ocr_executor
-    if _ocr_executor is not None:
-        _ocr_executor.shutdown(wait=True, cancel_futures=True)
-        _ocr_executor = None
+    _ocr_worker.shutdown()
 
 
 def discovery_key_matches(candidate: str) -> bool:
@@ -267,6 +323,12 @@ def decode_request_body(body: bytes) -> CandidateRequest:
     if tvdb_id is not None:
         if not isinstance(tvdb_id, str) or not _TVDB_ID_RE.fullmatch(tvdb_id):
             raise CandidateDiscoveryError(400, "invalid_tvdb_id", "tvdb_id is malformed")
+        if value["type"] == "movie":
+            raise CandidateDiscoveryError(
+                400,
+                "invalid_tvdb_id",
+                "tvdb_id is not supported for movie discovery",
+            )
     return CandidateRequest(
         media_type=value["type"],
         tmdb_id=value["tmdb_id"],
@@ -382,6 +444,8 @@ async def _bounded_response_bytes(
                 raise _SourceFailure("redirect")
             if response.status_code != 200:
                 raise _SourceFailure("upstream_status")
+            if response.headers.get("content-encoding"):
+                raise _SourceFailure("content_encoding")
             content_length = response.headers.get("content-length")
             if content_length:
                 try:
@@ -393,7 +457,7 @@ async def _bounded_response_bytes(
                 except ValueError as exc:
                     raise _SourceFailure("malformed_response") from exc
             body = bytearray()
-            async for chunk in response.aiter_bytes():
+            async for chunk in response.aiter_raw():
                 body.extend(chunk)
                 if len(body) > max_bytes:
                     raise _SourceFailure("response_too_large")
@@ -683,6 +747,14 @@ async def _fetch_screening_image(
             max_bytes=settings.max_image_bytes,
         )
     except _SourceFailure as exc:
+        if exc.reason in {
+            "transport",
+            "upstream_status",
+            "redirect",
+            "content_encoding",
+            "malformed_response",
+        }:
+            raise _ScreeningFailure() from exc
         raise _CandidateRejected() from exc
     if not body:
         raise _CandidateRejected()
@@ -695,12 +767,10 @@ async def _ocr_has_text(
     digest: str,
     titles: tuple[str, ...],
     settings: DiscoverySettings,
+    work: dict[str, Any],
 ) -> bool:
-    cache_key = (
-        f"candidate:{digest}:{DETECT_RES_SIG}:{OCR_POLICY_REVISION}:"
-        f"{settings.ocr_box_threshold:.4f}"
-    )
-    cached = get_cached_text_detection(cache_key)
+    cache_key = _ocr_cache_key(digest, titles, settings)
+    cached = await asyncio.to_thread(get_cached_text_detection, cache_key)
     if cached is not None:
         return cached
     if not text_detection_ready():
@@ -721,16 +791,45 @@ async def _ocr_has_text(
             ocr_image.close()
 
     try:
-        result = await asyncio.get_running_loop().run_in_executor(
-            _get_ocr_executor(),
-            _scan,
-        )
+        future = _ocr_worker.submit(_scan)
+        work["ocr_future"] = future
+        result = await asyncio.shield(asyncio.wrap_future(future))
+    except _DetectionUnavailable:
+        ocr_image.close()
+        raise
+    except asyncio.CancelledError:
+        raise
     except Exception as exc:
+        ocr_image.close()
         raise _DetectionUnavailable() from exc
     if result is None:
         raise _DetectionUnavailable()
-    set_cached_text_detection(cache_key, result)
+    await asyncio.to_thread(set_cached_text_detection, cache_key, result)
     return result
+
+
+def _ocr_cache_key(
+    digest: str,
+    titles: tuple[str, ...],
+    settings: DiscoverySettings,
+) -> str:
+    normalized_titles = sorted({
+        " ".join(unicodedata.normalize("NFKC", title).casefold().split())
+        for title in titles
+        if title.strip()
+    })
+    title_digest = hashlib.sha256(
+        json.dumps(
+            normalized_titles,
+            ensure_ascii=False,
+            separators=(",", ":"),
+        ).encode("utf-8")
+    ).hexdigest()
+    return (
+        f"candidate:{digest}:{DETECT_RES_SIG}:{OCR_POLICY_REVISION}:"
+        f"{OCR_TITLE_POLICY_REVISION}:{title_digest}:"
+        f"{settings.ocr_box_threshold:.4f}"
+    )
 
 
 async def _screen_source(
@@ -740,9 +839,11 @@ async def _screen_source(
     titles: tuple[str, ...],
     settings: DiscoverySettings,
     seen_digests: set[str],
-    work: dict[str, int],
-) -> list[SourceCandidate]:
+    work: dict[str, Any],
+) -> tuple[list[SourceCandidate], bool]:
     accepted = []
+    reliable = True
+    source_digests: list[str] = []
     for candidate in candidates:
         if work["ocr"] >= MAX_OCR_ATTEMPTS:
             break
@@ -752,6 +853,12 @@ async def _screen_source(
                 candidate,
                 settings,
             )
+        except _ScreeningFailure:
+            reliable = False
+            for source_digest in source_digests:
+                seen_digests.discard(source_digest)
+            accepted = []
+            break
         except _CandidateRejected:
             continue
         digest = hashlib.sha256(body).hexdigest()
@@ -759,9 +866,16 @@ async def _screen_source(
             image.close()
             continue
         seen_digests.add(digest)
+        source_digests.append(digest)
         work["ocr"] += 1
         try:
-            has_text = await _ocr_has_text(image, digest, titles, settings)
+            has_text = await _ocr_has_text(
+                image,
+                digest,
+                titles,
+                settings,
+                work,
+            )
         finally:
             image.close()
         if has_text:
@@ -791,7 +905,7 @@ async def _screen_source(
                 item.ordinal,
             )
         )
-    return accepted
+    return accepted, reliable
 
 
 def _alternate_sources(
@@ -825,7 +939,10 @@ def _cache_key(request: CandidateRequest, settings: DiscoverySettings) -> str:
                 request.media_type == "movie" or request.tvdb_id is not None
             ),
         },
-        "ocr": f"{DETECT_RES_SIG}:{OCR_POLICY_REVISION}:{settings.ocr_box_threshold:.4f}",
+        "ocr": (
+            f"{DETECT_RES_SIG}:{OCR_POLICY_REVISION}:"
+            f"{OCR_TITLE_POLICY_REVISION}:{settings.ocr_box_threshold:.4f}"
+        ),
         "ranking": RANKING_REVISION,
         "bounds": {
             "bytes": settings.max_image_bytes,
@@ -905,25 +1022,21 @@ def _validate_cached_response(
     return value
 
 
-async def discover_candidates(
+async def _run_discovery_search(
     client: httpx.AsyncClient,
     request: CandidateRequest,
     *,
-    settings: DiscoverySettings | None = None,
+    settings: DiscoverySettings,
+    cache_key: str,
 ) -> tuple[dict[str, Any], str]:
-    settings = settings or DiscoverySettings.from_config()
-    admission_failure = await _search_admission.start()
-    if admission_failure:
-        raise CandidateDiscoveryError(
-            429,
-            admission_failure,
-            "Artwork discovery capacity is temporarily exhausted",
-        )
+    work: dict[str, Any] = {"ocr": 0, "ocr_future": None}
+    loop = asyncio.get_running_loop()
+    deadline = loop.time() + SEARCH_DEADLINE_SECONDS
     try:
         try:
-            async with asyncio.timeout(SEARCH_DEADLINE_SECONDS):
-                cache_key = _cache_key(request, settings)
-                cached = get_cached_artwork_candidates(
+            async with asyncio.timeout_at(deadline):
+                cached = await asyncio.to_thread(
+                    get_cached_artwork_candidates,
                     cache_key,
                     complete_ttl=RESULT_CACHE_TTL_SECONDS,
                     partial_ttl=PARTIAL_CACHE_TTL_SECONDS,
@@ -935,6 +1048,13 @@ async def discover_candidates(
                 )
                 if validated_cache is not None:
                     return validated_cache, "cache"
+                active_ocr = _ocr_worker.active_future
+                if active_ocr is not None and not active_ocr.done():
+                    raise CandidateDiscoveryError(
+                        503,
+                        "text_detection_unavailable",
+                        "Text detection is unavailable or uncertain",
+                    )
                 if not text_detection_ready():
                     raise CandidateDiscoveryError(
                         503,
@@ -990,11 +1110,9 @@ async def discover_candidates(
                         "all_sources_failed",
                         "All configured artwork sources failed",
                     )
-
                 seen_digests: set[str] = set()
-                work = {"ocr": 0}
                 try:
-                    clean_tmdb = await _screen_source(
+                    clean_tmdb, tmdb_reliable = await _screen_source(
                         client,
                         tmdb_values,
                         titles=identity.titles,
@@ -1002,7 +1120,7 @@ async def discover_candidates(
                         seen_digests=seen_digests,
                         work=work,
                     )
-                    clean_fanart = await _screen_source(
+                    clean_fanart, fanart_reliable = await _screen_source(
                         client,
                         fanart_values,
                         titles=identity.titles,
@@ -1017,6 +1135,19 @@ async def discover_candidates(
                         "Text detection is unavailable or uncertain",
                     ) from exc
 
+                if statuses["tmdb"] == "ready" and not tmdb_reliable:
+                    statuses["tmdb"] = "failed"
+                    clean_tmdb = []
+                if statuses["fanart"] == "ready" and not fanart_reliable:
+                    statuses["fanart"] = "failed"
+                    clean_fanart = []
+                if not any(status == "ready" for status in statuses.values()):
+                    raise CandidateDiscoveryError(
+                        503,
+                        "all_sources_failed",
+                        "All configured artwork sources failed",
+                    )
+
                 selected = _alternate_sources(clean_tmdb, clean_fanart)
                 response = {
                     "schema_version": SCHEMA_VERSION,
@@ -1029,7 +1160,19 @@ async def discover_candidates(
                     if partial
                     else ("empty" if not selected else "complete")
                 )
-                set_cached_artwork_candidates(cache_key, response, result_class)
+                deadline_monotonic = time.monotonic() + max(
+                    0.0,
+                    deadline - loop.time(),
+                )
+                cached_before_deadline = await asyncio.to_thread(
+                    set_cached_artwork_candidates,
+                    cache_key,
+                    response,
+                    result_class,
+                    deadline_monotonic=deadline_monotonic,
+                )
+                if cached_before_deadline is False or loop.time() >= deadline:
+                    raise TimeoutError()
                 return response, result_class
         except TimeoutError as exc:
             raise CandidateDiscoveryError(
@@ -1038,4 +1181,50 @@ async def discover_candidates(
                 "Artwork discovery exceeded its deadline",
             ) from exc
     finally:
-        await _search_admission.finish()
+        active_ocr = work.get("ocr_future")
+        if active_ocr is not None and not active_ocr.done():
+            active_ocr.add_done_callback(
+                lambda _done: _search_admission.finish_from_worker()
+            )
+        else:
+            await _search_admission.finish()
+
+
+async def discover_candidates(
+    client: httpx.AsyncClient,
+    request: CandidateRequest,
+    *,
+    settings: DiscoverySettings | None = None,
+) -> tuple[dict[str, Any], str]:
+    settings = settings or DiscoverySettings.from_config()
+    cache_key = _cache_key(request, settings)
+    existing = _candidate_inflight.get(cache_key)
+    if existing is not None:
+        return await asyncio.shield(existing)
+
+    admission_failure = await _search_admission.start()
+    if admission_failure:
+        raise CandidateDiscoveryError(
+            429,
+            admission_failure,
+            "Artwork discovery capacity is temporarily exhausted",
+        )
+
+    task = asyncio.create_task(
+        _run_discovery_search(
+            client,
+            request,
+            settings=settings,
+            cache_key=cache_key,
+        )
+    )
+    _candidate_inflight[cache_key] = task
+
+    def _cleanup(done: "asyncio.Task[tuple[dict[str, Any], str]]") -> None:
+        if _candidate_inflight.get(cache_key) is done:
+            _candidate_inflight.pop(cache_key, None)
+        if not done.cancelled():
+            done.exception()
+
+    task.add_done_callback(_cleanup)
+    return await asyncio.shield(task)

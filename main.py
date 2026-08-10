@@ -23,6 +23,7 @@ from fastapi import FastAPI, HTTPException, Request
 from fastapi.responses import JSONResponse, Response, HTMLResponse
 from fastapi.staticfiles import StaticFiles
 from PIL import Image, ImageDraw, ImageFont, ImageOps, UnidentifiedImageError
+from starlette.routing import Match
 
 logging.basicConfig(
     level=logging.INFO,
@@ -3222,24 +3223,23 @@ def _load_genre_background(genre: str, style: str = "minimal") -> "Image.Image |
 app.mount("/static", StaticFiles(directory=os.path.join(BASE_DIR, "static")), name="static")
 
 
+def _request_targets_discovery_endpoint(request: Request) -> bool:
+    for route in app.router.routes:
+        match, _child_scope = route.matches(request.scope)
+        if match == Match.FULL and getattr(route, "name", None) == "artwork_candidates":
+            return True
+    return False
+
+
 @app.middleware("http")
 async def authenticate_and_harden(request: Request, call_next):
-    discovery_path = request.url.path == "/v1/artwork/candidates"
+    discovery_endpoint = _request_targets_discovery_endpoint(request)
     anonymous_path = (
         request.url.path == "/health"
         or request.url.path == "/static"
         or request.url.path.startswith("/static/")
     )
-    if discovery_path:
-        discovery_key = request.headers.get(
-            "x-jellyfin-artwork-discovery-key", ""
-        )
-        if not discovery_key_matches(discovery_key):
-            response = JSONResponse(status_code=403, content={"detail": "Unauthorized"})
-            response.headers["Cache-Control"] = "no-store"
-            response.headers["server"] = "unknown"
-            return response
-    elif not anonymous_path and _cfg.ACCESS_KEY:
+    if not discovery_endpoint and not anonymous_path and _cfg.ACCESS_KEY:
         header_key = request.headers.get("x-jellyfin-artwork-key", "")
         query_key = request.query_params.get("access_key", "")
         header_valid = _access_key_matches(header_key)
@@ -3252,7 +3252,7 @@ async def authenticate_and_harden(request: Request, call_next):
             response.headers["server"] = "unknown"
             return response
     response = await call_next(request)
-    if discovery_path:
+    if discovery_endpoint:
         response.headers["Cache-Control"] = "no-store"
     response.headers["server"] = "unknown"
     return response
@@ -3405,6 +3405,15 @@ def _text_detector_ready() -> bool:
 
 @app.post("/v1/artwork/candidates")
 async def artwork_candidates(request: Request):
+    discovery_key = request.headers.get(
+        "x-jellyfin-artwork-discovery-key", ""
+    )
+    if not discovery_key_matches(discovery_key):
+        raise CandidateDiscoveryError(
+            403,
+            "unauthorized",
+            "Unauthorized",
+        )
     if request.query_params:
         raise CandidateDiscoveryError(
             400,
@@ -3450,7 +3459,9 @@ async def artwork_candidates(request: Request):
         len(response["candidates"]),
         outcome,
     )
-    return JSONResponse(content=response)
+    result = JSONResponse(content=response)
+    result.headers["Cache-Control"] = "no-store"
+    return result
 
 
 @app.get("/stats")
