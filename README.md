@@ -145,10 +145,11 @@ All configuration is done via environment variables. Copy `.env.example` to `.en
 | `TVDB_NEG_CACHE_DURATION` | `3` | Days to cache a "no TVDB match / no art" result, so newly-added TVDB art is picked up sooner than a positive match |
 | `TVDB_TYPES_CACHE_DURATION` | `30` | Days to cache the TVDB artwork-type catalogue, which rarely changes |
 | `ACCESS_KEY` | - | Shared secret accepted in `X-Jellyfin-Artwork-Key`; legacy routes also accept `access_key` in the query unless header-only mode is enabled |
-| `HEADER_ONLY_AUTH` | `false` | Require header authentication globally. `/health` and static configurator assets remain anonymous; `/render/selected` is always header-only |
+| `HEADER_ONLY_AUTH` | `false` | Require header authentication globally. `/health` and static configurator assets remain anonymous; `/render/selected` and `/render/selection` are always header-only |
 | `RENDER_PROFILE_PATH` | - | Path to one read-only mounted YAML render profile (see `profile.example.yml`) |
 | `POSTERSPLUS_SOURCE_REVISION` | `unknown` | Exact source commit reported by `/ready`; release images set this automatically |
-| `SELECTED_MAX_BYTES` | `10485760` | Maximum encoded request-body size for `/render/selected` |
+| `SELECTED_MAX_BYTES` | `10485760` | Maximum decoded byte size for each caller-supplied image |
+| `SELECTION_MAX_BYTES` | `2 * base64(SELECTED_MAX_BYTES) + 4096` | Maximum encoded JSON request-body size for `/render/selection` |
 | `SELECTED_MAX_WIDTH` / `SELECTED_MAX_HEIGHT` | `8000` | Maximum decoded selected-image dimensions |
 | `SELECTED_MAX_PIXELS` | `20000000` | Maximum decoded selected-image pixel count |
 | `WORKERS` | `1` | Uvicorn worker processes. One worker avoids duplicate uncached renders, scans, and API work across processes |
@@ -374,13 +375,40 @@ curl --fail-with-body \
   "http://postersplus:8000/render/selected?profile=homestack-default&type=movie&tmdb_id=123&imdb_id=tt1234567"
 ```
 
+`POST /render/selection` accepts an exact Primary plus an optional exact Logo
+in a strict versioned JSON envelope:
+
+```json
+{
+  "schema_version": 1,
+  "primary": {
+    "content_type": "image/jpeg",
+    "sha256": "<lowercase SHA-256>",
+    "data": "<strict base64>"
+  },
+  "logo": {
+    "content_type": "image/png",
+    "sha256": "<lowercase SHA-256>",
+    "data": "<strict base64>"
+  }
+}
+```
+
+Set `logo` to `null` to retain normal provider-logo fallback. A supplied Logo
+bypasses provider-logo selection but keeps the profile's crop, size, and
+placement behavior. The service rejects transparent Logos and rejects, rather
+than suppresses, an explicit Logo when OCR finds title text in the supplied
+Primary. Error responses contain a stable `error.code`.
+
 The response includes an accurate `Content-Type`, standard `Digest`,
 hexadecimal `X-Image-SHA256`, `X-Render-Profile-SHA256`, and
-`X-Renderer-Revision`. The service rejects oversized, malformed,
-MIME-mismatched, or decompression-bomb inputs. Profile defaults use the same
-validated request-configuration path as `/poster`; visual query overrides are
-not accepted on this endpoint. Mount the profile read-only and set
-`RENDER_PROFILE_PATH=/app/profile.yml`.
+`X-Renderer-Revision`. Private render responses also report
+`X-Selected-Primary-SHA256`, `X-Logo-Source`, and
+`X-Selected-Logo-SHA256` when a Logo was supplied. The service rejects
+oversized, malformed, MIME-mismatched, hash-mismatched, or decompression-bomb
+inputs. Profile defaults use the same validated request-configuration path as
+`/poster`; visual query overrides are not accepted on either private endpoint.
+Mount the profile read-only and set `RENDER_PROFILE_PATH=/app/profile.yml`.
 
 ### Operator endpoints
 

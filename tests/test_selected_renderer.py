@@ -414,6 +414,7 @@ class ResponseAndCacheIdentityTests(unittest.TestCase):
         base = {
             "base_identity": "settings",
             "selected_sha256": "base-a",
+            "selected_logo_sha256": None,
             "profile_digest": "profile-a",
             "renderer_revision": "revision-a",
             "imdb_id": "tt1",
@@ -427,6 +428,7 @@ class ResponseAndCacheIdentityTests(unittest.TestCase):
         original = main._selected_cache_identity(**base)
         for field, replacement in (
             ("selected_sha256", "base-b"),
+            ("selected_logo_sha256", "logo-b"),
             ("profile_digest", "profile-b"),
             ("renderer_revision", "revision-b"),
             ("imdb_id", "tt2"),

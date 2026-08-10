@@ -1,9 +1,11 @@
 #main.py
 import asyncio
 import base64
+import binascii
 import hashlib
 import hmac
 import io
+import json
 import logging
 import os
 import re
@@ -685,6 +687,20 @@ class _SelectedImage:
     decoded_format: str
 
 
+@dataclass(frozen=True)
+class _SelectionEnvelope:
+    primary: _SelectedImage
+    logo: _SelectedImage | None
+
+
+class _SelectionError(Exception):
+    def __init__(self, status_code: int, code: str, message: str):
+        super().__init__(message)
+        self.status_code = status_code
+        self.code = code
+        self.message = message
+
+
 def _check_tmdb_id(val: str) -> None:
     if not _TMDB_ID_RE.match(val):
         raise HTTPException(status_code=400, detail="Invalid tmdb_id")
@@ -755,6 +771,41 @@ def _access_key_matches(candidate: str) -> bool:
 
 
 async def _read_selected_body(request: Request) -> bytes:
+    return await _read_bounded_body(
+        request,
+        max_bytes=_cfg.SELECTED_MAX_BYTES,
+        empty_message="Selected image body is empty",
+        too_large_message="Selected image body is too large",
+    )
+
+
+async def _read_selection_body(request: Request) -> bytes:
+    content_type = request.headers.get("content-type", "")
+    if content_type.split(";", 1)[0].strip().lower() != "application/json":
+        raise _SelectionError(
+            415,
+            "invalid_content_type",
+            "Content-Type must be application/json",
+        )
+    try:
+        return await _read_bounded_body(
+            request,
+            max_bytes=_cfg.SELECTION_MAX_BYTES,
+            empty_message="Selection body is empty",
+            too_large_message="Selection body is too large",
+        )
+    except HTTPException as exc:
+        code = "body_too_large" if exc.status_code == 413 else "invalid_body"
+        raise _SelectionError(exc.status_code, code, str(exc.detail)) from exc
+
+
+async def _read_bounded_body(
+    request: Request,
+    *,
+    max_bytes: int,
+    empty_message: str,
+    too_large_message: str,
+) -> bytes:
     content_length = request.headers.get("content-length")
     if content_length:
         try:
@@ -763,16 +814,16 @@ async def _read_selected_body(request: Request) -> bytes:
             raise HTTPException(status_code=400, detail="Invalid Content-Length") from exc
         if declared_length < 0:
             raise HTTPException(status_code=400, detail="Invalid Content-Length")
-        if declared_length > _cfg.SELECTED_MAX_BYTES:
-            raise HTTPException(status_code=413, detail="Selected image body is too large")
+        if declared_length > max_bytes:
+            raise HTTPException(status_code=413, detail=too_large_message)
 
     body = bytearray()
     async for chunk in request.stream():
         body.extend(chunk)
-        if len(body) > _cfg.SELECTED_MAX_BYTES:
-            raise HTTPException(status_code=413, detail="Selected image body is too large")
+        if len(body) > max_bytes:
+            raise HTTPException(status_code=413, detail=too_large_message)
     if not body:
-        raise HTTPException(status_code=400, detail="Selected image body is empty")
+        raise HTTPException(status_code=400, detail=empty_message)
     return bytes(body)
 
 
@@ -827,6 +878,135 @@ def _decode_selected_image(body: bytes, content_type: str) -> _SelectedImage:
     )
 
 
+def _decode_selection_envelope(body: bytes) -> _SelectionEnvelope:
+    def _object(pairs):
+        result = {}
+        for key, value in pairs:
+            if key in result:
+                raise _SelectionError(
+                    400,
+                    "duplicate_field",
+                    f"Duplicate JSON field: {key}",
+                )
+            result[key] = value
+        return result
+
+    try:
+        envelope = json.loads(body, object_pairs_hook=_object)
+    except _SelectionError:
+        raise
+    except (UnicodeDecodeError, json.JSONDecodeError) as exc:
+        raise _SelectionError(400, "invalid_json", "Malformed JSON body") from exc
+
+    if not isinstance(envelope, dict) or set(envelope) != {
+        "schema_version",
+        "primary",
+        "logo",
+    }:
+        raise _SelectionError(
+            400,
+            "invalid_schema",
+            "Selection body must contain exactly schema_version, primary, and logo",
+        )
+    if type(envelope["schema_version"]) is not int or envelope["schema_version"] != 1:
+        raise _SelectionError(
+            400,
+            "unsupported_schema",
+            "schema_version must be 1",
+        )
+
+    primary = _decode_selection_part(envelope["primary"], "primary")
+    logo_value = envelope["logo"]
+    logo = None if logo_value is None else _decode_selection_part(logo_value, "logo")
+    if logo is not None and not _logo_has_visible_pixels(logo.image):
+        raise _SelectionError(
+            422,
+            "selected_logo_empty",
+            "Selected Logo has no meaningful visible pixels",
+        )
+    return _SelectionEnvelope(primary=primary, logo=logo)
+
+
+def _decode_selection_part(value, field_name: str) -> _SelectedImage:
+    if not isinstance(value, dict) or set(value) != {
+        "content_type",
+        "sha256",
+        "data",
+    }:
+        raise _SelectionError(
+            400,
+            "invalid_schema",
+            f"{field_name} must contain exactly content_type, sha256, and data",
+        )
+    content_type = value["content_type"]
+    expected_sha256 = value["sha256"]
+    encoded = value["data"]
+    if not all(isinstance(item, str) for item in (
+        content_type,
+        expected_sha256,
+        encoded,
+    )):
+        raise _SelectionError(
+            400,
+            "invalid_schema",
+            f"{field_name} fields must be strings",
+        )
+    if re.fullmatch(r"[0-9a-f]{64}", expected_sha256) is None:
+        raise _SelectionError(
+            400,
+            "invalid_sha256",
+            f"{field_name}.sha256 must be 64 lowercase hexadecimal characters",
+        )
+    max_encoded = 4 * ((_cfg.SELECTED_MAX_BYTES + 2) // 3)
+    if len(encoded) > max_encoded:
+        raise _SelectionError(
+            413,
+            "image_too_large",
+            f"{field_name} image is too large",
+        )
+    try:
+        image_bytes = base64.b64decode(encoded, validate=True)
+    except (binascii.Error, ValueError, UnicodeEncodeError) as exc:
+        raise _SelectionError(
+            400,
+            "invalid_base64",
+            f"{field_name}.data is not strict base64",
+        ) from exc
+    if not image_bytes:
+        raise _SelectionError(
+            400,
+            "empty_image",
+            f"{field_name} image is empty",
+        )
+    if len(image_bytes) > _cfg.SELECTED_MAX_BYTES:
+        raise _SelectionError(
+            413,
+            "image_too_large",
+            f"{field_name} image is too large",
+        )
+    actual_sha256 = hashlib.sha256(image_bytes).hexdigest()
+    if not hmac.compare_digest(actual_sha256, expected_sha256):
+        raise _SelectionError(
+            400,
+            "image_hash_mismatch",
+            f"{field_name} SHA-256 does not match decoded bytes",
+        )
+    try:
+        return _decode_selected_image(image_bytes, content_type)
+    except HTTPException as exc:
+        raise _SelectionError(
+            exc.status_code,
+            "invalid_image",
+            f"{field_name}: {exc.detail}",
+        ) from exc
+
+
+def _logo_has_visible_pixels(image: Image.Image) -> bool:
+    alpha = np.asarray(image.getchannel("A"))
+    visible = int(np.count_nonzero(alpha > 32))
+    return visible >= max(4, image.width * image.height // 100_000)
+
+
 def _image_response(
     content: bytes,
     output_format: str,
@@ -871,6 +1051,7 @@ def _selected_cache_identity(
     *,
     base_identity: str,
     selected_sha256: str,
+    selected_logo_sha256: str | None,
     profile_digest: str,
     renderer_revision: str,
     imdb_id: str,
@@ -884,6 +1065,7 @@ def _selected_cache_identity(
     return (
         base_identity
         + f"|base={selected_sha256}"
+        + f"|logo={selected_logo_sha256 or 'provider'}"
         + f"|profile={profile_digest}"
         + f"|revision={renderer_revision}"
         + f"|ids={imdb_id}:{tmdb_id}:{media_type}"
@@ -2938,6 +3120,21 @@ async def lifespan(app: FastAPI):
 
 
 app = FastAPI(lifespan=lifespan)
+
+
+@app.exception_handler(_SelectionError)
+async def _selection_error_response(_request: Request, exc: _SelectionError):
+    return JSONResponse(
+        status_code=exc.status_code,
+        content={
+            "error": {
+                "code": exc.code,
+                "message": exc.message,
+            }
+        },
+    )
+
+
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))
 _FONTS_DIR = os.path.join(BASE_DIR, "fonts")
 
@@ -3472,6 +3669,7 @@ async def _render_poster(
     debug: str | None = None,
     nocache: str | None = None,
     selected_image: _SelectedImage | None = None,
+    selected_logo: _SelectedImage | None = None,
     profile: RenderProfile | None = None,
     output_format: str | None = None,
 ):
@@ -3573,6 +3771,12 @@ async def _render_poster(
         }
     )
     rcfg = build_request_config(raw_params)
+    if selected_logo is not None and rcfg.textless:
+        raise _SelectionError(
+            409,
+            "selected_logo_disabled_by_profile",
+            "The active render profile disables Logo composition",
+        )
 
     # Anime is essentially always Japanese, so the foreign-language slot says
     # nothing here — but ranked highly (a reasonable choice for live-action,
@@ -3635,6 +3839,9 @@ async def _render_poster(
             _identity = _selected_cache_identity(
                 base_identity=_identity,
                 selected_sha256=selected_image.sha256,
+                selected_logo_sha256=(
+                    selected_logo.sha256 if selected_logo is not None else None
+                ),
                 profile_digest=profile.digest if profile is not None else "",
                 renderer_revision=_cfg.SOURCE_REVISION,
                 imdb_id=imdb_id,
@@ -4351,7 +4558,10 @@ async def _render_poster(
             _detection_result = get_cached_text_detection(_det_key)
             if _detection_result is None:
                 _base_image_coro = _image_coro
-                if _vote_detection_ok:
+                _foreground_detection_required = (
+                    _vote_detection_ok or selected_logo is not None
+                )
+                if _foreground_detection_required:
                     _reserve_foreground_detection()
 
                 async def _fetch_image_and_schedule_detection():
@@ -4359,10 +4569,10 @@ async def _render_poster(
                     try:
                         fetched_image = await _base_image_coro
                     except BaseException:
-                        if _vote_detection_ok:
+                        if _foreground_detection_required:
                             _release_foreground_detection()
                         raise
-                    if _vote_detection_ok:
+                    if _foreground_detection_required:
                         _detection_task = _start_text_detection(
                             _det_key,
                             fetched_image,
@@ -4443,7 +4653,13 @@ async def _render_poster(
             trending_rank,
         ) = await asyncio.gather(
             _image_coro,
-            _resolve_logo() if (is_textless and not is_no_poster) else _resolved(None),
+            (
+                _resolved(selected_logo.image.copy())
+                if selected_logo is not None
+                else _resolve_logo()
+            )
+            if (is_textless and not is_no_poster)
+            else _resolved(None),
             rating_coro,
             # Trending rank is a TMDB list lookup, so it needs a real tmdb_id —
             # which AIOMetadata does send alongside the anime id when it has one.
@@ -4835,6 +5051,13 @@ async def _render_poster(
                     f"Burned-in text detected on textless poster {tmdb_id} "
                     f"(votes={_vc}); skipping logo/title overlay"
                 )
+                if selected_logo is not None:
+                    raise _SelectionError(
+                        422,
+                        "selected_primary_contains_text",
+                        "Selected Primary contains title text and cannot be "
+                        "combined with the selected Logo",
+                    )
             elif _suppress_overlay is False:
                 logger.info(
                     f"No burned-in text detected on textless poster {tmdb_id} "
@@ -4842,6 +5065,12 @@ async def _render_poster(
                 )
             else:
                 from text_detect import text_detection_status
+                if selected_logo is not None:
+                    raise _SelectionError(
+                        503,
+                        "text_detection_unavailable",
+                        "Selected Primary could not be checked for title text",
+                    )
                 logger.warning(
                     f"Burned-in text scan unavailable for {tmdb_id}; "
                     f"result was not cached ({text_detection_status()})"
@@ -4907,6 +5136,10 @@ async def _render_poster(
 
         return _image_response(img_bytes, output_format, client_cache_key)
 
+    except _SelectionError as exc:
+        if _render_fut is not None and not _render_fut.done():
+            _render_fut.set_exception(exc)
+        raise
     except ValueError as exc:
         if _render_fut is not None and not _render_fut.done():
             _render_fut.set_exception(exc)
@@ -5017,39 +5250,48 @@ async def get_poster(
     )
 
 
-@app.post("/render/selected")
-async def render_selected(
+def _validate_private_render_request(
     request: Request,
     profile: str,
     tmdb_id: str,
     imdb_id: str,
-    type: str = "movie",
-    quality: str = "",
-    season: int = 1,
-    episode: int = 1,
-    output_format: str = "jpeg",
-):
-    _check_tmdb_id(tmdb_id)
-    _check_imdb_id(imdb_id)
-    _check_type(type)
+    media_type: str,
+    season: int,
+    episode: int,
+    output_format: str,
+    *,
+    machine_errors: bool = False,
+) -> tuple[RenderProfile, str]:
+    def _fail(status_code: int, code: str, message: str):
+        if machine_errors:
+            raise _SelectionError(status_code, code, message)
+        raise HTTPException(status_code=status_code, detail=message)
+
+    try:
+        _check_tmdb_id(tmdb_id)
+        _check_imdb_id(imdb_id)
+        _check_type(media_type)
+    except HTTPException as exc:
+        _fail(exc.status_code, "invalid_request", str(exc.detail))
     normalized_output_format = output_format.lower()
     if normalized_output_format not in _OUTPUT_FORMATS:
-        raise HTTPException(status_code=400, detail="Invalid output_format")
+        _fail(400, "invalid_request", "Invalid output_format")
     if season < 1 or episode < 1:
-        raise HTTPException(status_code=400, detail="season and episode must be positive")
+        _fail(400, "invalid_request", "season and episode must be positive")
     if not _cfg.ACCESS_KEY:
-        raise HTTPException(
-            status_code=503,
-            detail="ACCESS_KEY must be configured for selected rendering",
+        _fail(
+            503,
+            "renderer_unavailable",
+            "ACCESS_KEY must be configured for selected rendering",
         )
     header_key = request.headers.get("x-jellyfin-artwork-key", "")
     if not _access_key_matches(header_key):
-        raise HTTPException(status_code=403, detail="Unauthorized")
+        _fail(403, "unauthorized", "Unauthorized")
     render_profile = _render_profile
     if render_profile is None:
-        raise HTTPException(status_code=503, detail="Render profile is not loaded")
+        _fail(503, "renderer_unavailable", "Render profile is not loaded")
     if profile != render_profile.name:
-        raise HTTPException(status_code=404, detail="Unknown render profile")
+        _fail(404, "unknown_profile", "Unknown render profile")
 
     allowed_query = {
         "episode",
@@ -5063,10 +5305,52 @@ async def render_selected(
     }
     unknown_query = sorted(set(request.query_params) - allowed_query)
     if unknown_query:
-        raise HTTPException(
-            status_code=400,
-            detail=f"Unsupported query parameters: {', '.join(unknown_query)}",
+        _fail(
+            400,
+            "invalid_request",
+            f"Unsupported query parameters: {', '.join(unknown_query)}",
         )
+    return render_profile, normalized_output_format
+
+
+def _apply_private_render_headers(
+    response: Response,
+    render_profile: RenderProfile,
+    primary: _SelectedImage,
+    logo: _SelectedImage | None,
+) -> None:
+    response.headers["X-Render-Profile-SHA256"] = render_profile.digest
+    response.headers["X-Renderer-Revision"] = _cfg.SOURCE_REVISION
+    response.headers["X-Selected-Primary-SHA256"] = primary.sha256
+    response.headers["X-Logo-Source"] = "selected" if logo is not None else "provider"
+    if logo is not None:
+        response.headers["X-Selected-Logo-SHA256"] = logo.sha256
+    response.headers["Cache-Control"] = "no-store"
+    response.headers["Pragma"] = "no-cache"
+
+
+@app.post("/render/selected")
+async def render_selected(
+    request: Request,
+    profile: str,
+    tmdb_id: str,
+    imdb_id: str,
+    type: str = "movie",
+    quality: str = "",
+    season: int = 1,
+    episode: int = 1,
+    output_format: str = "jpeg",
+):
+    render_profile, normalized_output_format = _validate_private_render_request(
+        request,
+        profile,
+        tmdb_id,
+        imdb_id,
+        type,
+        season,
+        episode,
+        output_format,
+    )
 
     body = await _read_selected_body(request)
     selected_image = await asyncio.get_running_loop().run_in_executor(
@@ -5087,8 +5371,70 @@ async def render_selected(
         profile=render_profile,
         output_format=normalized_output_format,
     )
-    response.headers["X-Render-Profile-SHA256"] = render_profile.digest
-    response.headers["X-Renderer-Revision"] = _cfg.SOURCE_REVISION
-    response.headers["Cache-Control"] = "no-store"
-    response.headers["Pragma"] = "no-cache"
+    _apply_private_render_headers(
+        response,
+        render_profile,
+        selected_image,
+        None,
+    )
+    return response
+
+
+@app.post("/render/selection")
+async def render_selection(
+    request: Request,
+    profile: str,
+    tmdb_id: str,
+    imdb_id: str,
+    type: str = "movie",
+    quality: str = "",
+    season: int = 1,
+    episode: int = 1,
+    output_format: str = "jpeg",
+):
+    render_profile, normalized_output_format = _validate_private_render_request(
+        request,
+        profile,
+        tmdb_id,
+        imdb_id,
+        type,
+        season,
+        episode,
+        output_format,
+        machine_errors=True,
+    )
+    body = await _read_selection_body(request)
+    selection = await asyncio.get_running_loop().run_in_executor(
+        None,
+        _decode_selection_envelope,
+        body,
+    )
+    if selection.logo is not None and (
+        not _cfg.TEXTLESS_TEXT_DETECTION or not _text_detector_ready()
+    ):
+        raise _SelectionError(
+            503,
+            "text_detection_unavailable",
+            "Text detection must be ready for an explicit selected Logo",
+        )
+
+    response = await _render_poster(
+        request=request,
+        tmdb_id=tmdb_id,
+        imdb_id=imdb_id,
+        type=type,
+        quality=quality,
+        season=season,
+        episode=episode,
+        selected_image=selection.primary,
+        selected_logo=selection.logo,
+        profile=render_profile,
+        output_format=normalized_output_format,
+    )
+    _apply_private_render_headers(
+        response,
+        render_profile,
+        selection.primary,
+        selection.logo,
+    )
     return response
