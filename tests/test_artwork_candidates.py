@@ -257,7 +257,7 @@ class AdapterTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(len(values), 1)
         self.assertNotIn("key", values[0].url)
 
-    async def test_series_fanart_is_skipped_without_verified_tvdb_identity(self):
+    async def test_series_fanart_returns_no_candidates_without_verified_tvdb_identity(self):
         handler = AsyncMock()
         async with httpx.AsyncClient(transport=httpx.MockTransport(handler)) as client:
             values = await candidates._fanart_candidates(
@@ -489,6 +489,18 @@ class DiscoveryPipelineTests(unittest.IsolatedAsyncioTestCase):
             [item["source"] for item in response["candidates"]],
             ["tmdb", "fanart"] * 4,
         )
+        self.assertEqual(
+            set(response),
+            {"schema_version", "sources", "candidates"},
+        )
+        self.assertEqual(set(response["sources"]), {"tmdb", "fanart"})
+        self.assertTrue(
+            set(response["sources"].values()) <= {"ready", "failed"}
+        )
+        self.assertTrue(all(
+            set(item) == {"source", "url", "width", "height", "language"}
+            for item in response["candidates"]
+        ))
         cache_write.assert_called_once()
         self.assertEqual(cache_write.call_args.args[2], "complete")
 
@@ -542,7 +554,6 @@ class DiscoveryPipelineTests(unittest.IsolatedAsyncioTestCase):
         )
         (response, outcome), cache_write = await self._discover_with_patches(
             tmdb_values=[item],
-            fanart_enabled=False,
             ocr_result=True,
         )
         self.assertEqual(response["candidates"], [])
@@ -565,6 +576,46 @@ class DiscoveryPipelineTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(response["sources"]["fanart"], "failed")
         self.assertEqual(outcome, "partial")
         self.assertEqual(cache_write.call_args.args[2], "partial")
+
+    async def test_unavailable_fanart_contract_reports_failed(self):
+        with (
+            patch.object(
+                candidates,
+                "_fetch_identity",
+                AsyncMock(return_value=candidates._Identity(("Title",), False)),
+            ),
+            patch.object(candidates, "_tmdb_candidates", AsyncMock(return_value=[])),
+            patch.object(candidates, "_fanart_candidates", AsyncMock()) as fanart,
+            patch.object(candidates, "get_cached_artwork_candidates", return_value=None),
+            patch.object(candidates, "set_cached_artwork_candidates"),
+            patch.object(candidates, "text_detection_ready", return_value=True),
+        ):
+            response, outcome = await candidates.discover_candidates(
+                Mock(),
+                _request("series"),
+                settings=_settings(),
+            )
+            missing_keys_response, missing_keys_outcome = (
+                await candidates.discover_candidates(
+                    Mock(),
+                    _request("movie"),
+                    settings=_settings(
+                        fanart_project_api_key="",
+                        fanart_client_key="",
+                    ),
+                )
+            )
+        self.assertEqual(
+            response["sources"],
+            {"tmdb": "ready", "fanart": "failed"},
+        )
+        self.assertEqual(outcome, "partial")
+        self.assertEqual(
+            missing_keys_response["sources"],
+            {"tmdb": "ready", "fanart": "failed"},
+        )
+        self.assertEqual(missing_keys_outcome, "partial")
+        fanart.assert_not_awaited()
 
     async def test_all_configured_sources_failed_is_503_and_not_cached(self):
         with self.assertRaises(candidates.CandidateDiscoveryError) as raised:
@@ -646,7 +697,7 @@ class DiscoveryPipelineTests(unittest.IsolatedAsyncioTestCase):
     async def test_valid_result_cache_skips_all_upstream_work(self):
         cached = {
             "schema_version": 1,
-            "sources": {"tmdb": "ready", "fanart": "disabled"},
+            "sources": {"tmdb": "ready", "fanart": "failed"},
             "candidates": [{
                 "source": "tmdb",
                 "url": "https://image.tmdb.org/t/p/original/clean.jpg",
@@ -667,6 +718,37 @@ class DiscoveryPipelineTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(response, cached)
         self.assertEqual(outcome, "cache")
         identity.assert_not_awaited()
+
+    def test_cached_contract_rejects_legacy_statuses_and_extra_candidate_fields(self):
+        base = {
+            "schema_version": 1,
+            "sources": {"tmdb": "ready", "fanart": "failed"},
+            "candidates": [{
+                "source": "tmdb",
+                "url": "https://image.tmdb.org/t/p/original/clean.jpg",
+                "width": 600,
+                "height": 900,
+                "language": None,
+            }],
+        }
+        legacy = json.loads(json.dumps(base))
+        legacy["sources"]["fanart"] = "disabled"
+        self.assertIsNone(
+            candidates._validate_cached_response(
+                legacy,
+                _request(),
+                _settings(),
+            )
+        )
+        extra = json.loads(json.dumps(base))
+        extra["candidates"][0]["sha256"] = "a" * 64
+        self.assertIsNone(
+            candidates._validate_cached_response(
+                extra,
+                _request(),
+                _settings(),
+            )
+        )
 
     async def test_deadline_is_a_typed_uncached_503(self):
         async def slow(*_args):
@@ -724,7 +806,7 @@ class CandidateCacheTests(unittest.TestCase):
     def test_complete_empty_and_partial_ttls_are_distinct(self):
         response = {
             "schema_version": 1,
-            "sources": {"tmdb": "ready", "fanart": "disabled"},
+            "sources": {"tmdb": "ready", "fanart": "failed"},
             "candidates": [],
         }
         with (
@@ -784,7 +866,7 @@ class EndpointContractTests(unittest.IsolatedAsyncioTestCase):
     async def test_discovery_auth_is_separate_from_render_auth(self):
         success = {
             "schema_version": 1,
-            "sources": {"tmdb": "ready", "fanart": "disabled"},
+            "sources": {"tmdb": "ready", "fanart": "failed"},
             "candidates": [],
         }
         with (

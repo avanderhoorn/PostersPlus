@@ -842,6 +842,14 @@ def _validate_cached_response(
         return None
     if value["schema_version"] != SCHEMA_VERSION or not isinstance(value["sources"], dict):
         return None
+    if (
+        set(value["sources"]) != {"tmdb", "fanart"}
+        or any(
+            status not in ("ready", "failed")
+            for status in value["sources"].values()
+        )
+    ):
+        return None
     candidates = value["candidates"]
     if not isinstance(candidates, list) or len(candidates) > MAX_RESULTS:
         return None
@@ -928,13 +936,13 @@ async def discover_candidates(
                 statuses = {
                     "tmdb": "ready",
                     "fanart": (
-                        "disabled"
-                        if not settings.fanart_enabled
-                        else (
-                            "skipped"
-                            if request.media_type == "series" and not identity.tvdb_verified
-                            else "ready"
+                        "ready"
+                        if settings.fanart_enabled
+                        and (
+                            request.media_type == "movie"
+                            or identity.tvdb_verified
                         )
+                        else "failed"
                     ),
                 }
                 tmdb_values: list[SourceCandidate] = []

@@ -383,6 +383,9 @@ queries TMDb and optionally Fanart.tv, screens bounded portrait bytes with one
 OCR worker, deduplicates exact bytes, alternates source-ranked results, and
 returns at most eight credential-free HTTPS URLs from `image.tmdb.org` or
 `assets.fanart.tv`. Series Fanart results require a verified TVDB ID.
+The response always contains exactly `tmdb` and `fanart` source keys, each
+reported as only `ready` or `failed`; missing Fanart credentials or an
+unverified Series TVDB identity report Fanart as `failed`.
 
 Successful complete or empty searches cache for 24 hours; partial-source
 results cache for 15 minutes. Detection uncertainty, deadline failures, and
