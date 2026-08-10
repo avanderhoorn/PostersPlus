@@ -145,6 +145,9 @@ All configuration is done via environment variables. Copy `.env.example` to `.en
 | `TVDB_NEG_CACHE_DURATION` | `3` | Days to cache a "no TVDB match / no art" result, so newly-added TVDB art is picked up sooner than a positive match |
 | `TVDB_TYPES_CACHE_DURATION` | `30` | Days to cache the TVDB artwork-type catalogue, which rarely changes |
 | `ACCESS_KEY` | - | Shared secret accepted in `X-Jellyfin-Artwork-Key`; legacy routes also accept `access_key` in the query unless header-only mode is enabled |
+| `JELLYFIN_ARTWORK_DISCOVERY_KEY` | derived from `ACCESS_KEY` | Optional explicit header-only secret for `POST /v1/artwork/candidates`. When unset, the key is `HMAC-SHA256(ACCESS_KEY, "jellyfin-artwork-discovery-v1").hexdigest()`. It must differ from `ACCESS_KEY` and is never accepted by render routes |
+| `JELLYFIN_ARTWORK_FANART_PROJECT_API_KEY` | - | Fanart.tv v3 PostersPlus application key, sent only as Fanart's `api_key` metadata parameter |
+| `JELLYFIN_ARTWORK_FANART_CLIENT_KEY` | - | Fanart.tv v3 operator key, sent only as Fanart's `client_key` metadata parameter |
 | `HEADER_ONLY_AUTH` | `false` | Require header authentication globally. `/health` and static configurator assets remain anonymous; `/render/selected` and `/render/selection` are always header-only |
 | `RENDER_PROFILE_PATH` | - | Path to one read-only mounted YAML render profile (see `profile.example.yml`) |
 | `POSTERSPLUS_SOURCE_REVISION` | `unknown` | Exact source commit reported by `/ready`; release images set this automatically |
@@ -358,6 +361,59 @@ What changes on this path:
 - **Sashes** are limited to what the provider knows: lifecycle status (airing / ended / cancelled) works; awards, trending, digital-release and cinema status do not, because those are TMDB/MDBList lookups with nothing to match against.
 
 If you only want MyAnimeList *scores* on anime that already has an IMDb id, you don't need any of this — MDBList already returns a `myanimelist` rating, so just give that source a non-zero weight.
+
+### Clean Primary candidate discovery
+
+`POST /v1/artwork/candidates` is the renderer's bounded, discovery-only
+operation for Jellyfin's **Homestack Clean Artwork** provider. It requires
+`X-Jellyfin-Artwork-Discovery-Key`; `X-Jellyfin-Artwork-Key` and query-string
+credentials are rejected.
+
+For integrated deployments, leave `JELLYFIN_ARTWORK_DISCOVERY_KEY` unset and
+derive the header value as the lowercase hexadecimal
+`HMAC-SHA256(key=ACCESS_KEY bytes, message="jellyfin-artwork-discovery-v1")`.
+An explicit dedicated key remains supported for standalone deployments and
+overrides derivation. Either form is domain-separated from render auth and
+cannot authenticate render routes.
+
+```bash
+curl --fail-with-body \
+  -H "X-Jellyfin-Artwork-Discovery-Key: $JELLYFIN_ARTWORK_DISCOVERY_KEY" \
+  -H "Content-Type: application/json" \
+  --data '{"schema_version":1,"type":"movie","tmdb_id":"123"}' \
+  http://postersplus:8000/v1/artwork/candidates
+```
+
+The exact schema requires `schema_version: 1`, `type` (`movie` or `series`),
+and a string `tmdb_id`. `imdb_id` and `tvdb_id` may each be omitted or set to
+`null`; when non-null they must be valid strings and are cross-checked against
+TMDb. A non-null `tvdb_id` is accepted only for `series`; Movies reject it
+because TMDb movie external IDs do not provide a verified TVDB mapping.
+PostersPlus queries TMDb and optionally Fanart.tv, screens bounded
+portrait bytes with one OCR worker, deduplicates exact bytes, alternates
+source-ranked results, and returns at most eight credential-free HTTPS URLs
+from `image.tmdb.org` or `assets.fanart.tv`. Series Fanart results require a
+supplied, verified TVDB ID.
+The response always contains exactly `tmdb` and `fanart` source keys, each
+reported as only `ready` or `failed`; missing Fanart credentials or an
+unverified Series TVDB identity report Fanart as `failed`.
+
+Successful complete or empty searches cache for 24 hours; partial-source
+results cache for 15 minutes. Detection uncertainty, deadline failures, and
+all-source failures return 503 and are not cached. Every response uses
+`Cache-Control: no-store`; there is no title-bearing fallback.
+
+Candidate OCR has one non-queuing worker slot. A native OCR call cannot be
+killed safely after it starts; if the 20-second request deadline expires, its
+search admission and worker slot remain occupied until that call returns, and
+new scans fail rather than queue copied images. The worker is daemonized so
+shutdown never waits indefinitely for an unkillable native call.
+
+CDN redirects, transport/status failures, and encoded responses make that
+source unreliable rather than clean-empty. Results from another reliably
+screened source may return as a 15-minute partial result; no reliable source
+returns 503. Image bytes are read raw under the configured byte limit before
+decoding.
 
 ### Private selected-image renderer
 
