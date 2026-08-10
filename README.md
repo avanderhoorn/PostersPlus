@@ -373,16 +373,18 @@ credentials are rejected.
 curl --fail-with-body \
   -H "X-Jellyfin-Artwork-Discovery-Key: $JELLYFIN_ARTWORK_DISCOVERY_KEY" \
   -H "Content-Type: application/json" \
-  --data '{"schema_version":1,"type":"movie","tmdb_id":"123","imdb_id":"tt1234567"}' \
+  --data '{"schema_version":1,"type":"movie","tmdb_id":"123"}' \
   http://postersplus:8000/v1/artwork/candidates
 ```
 
-The exact schema accepts `type` (`movie` or `series`), string TMDb and IMDb
-IDs, and an optional string TVDB ID. PostersPlus verifies the identities,
-queries TMDb and optionally Fanart.tv, screens bounded portrait bytes with one
-OCR worker, deduplicates exact bytes, alternates source-ranked results, and
-returns at most eight credential-free HTTPS URLs from `image.tmdb.org` or
-`assets.fanart.tv`. Series Fanart results require a verified TVDB ID.
+The exact schema requires `schema_version: 1`, `type` (`movie` or `series`),
+and a string `tmdb_id`. `imdb_id` and `tvdb_id` may each be omitted or set to
+`null`; when non-null they must be valid strings and are cross-checked against
+TMDb. PostersPlus queries TMDb and optionally Fanart.tv, screens bounded
+portrait bytes with one OCR worker, deduplicates exact bytes, alternates
+source-ranked results, and returns at most eight credential-free HTTPS URLs
+from `image.tmdb.org` or `assets.fanart.tv`. Series Fanart results require a
+supplied, verified TVDB ID.
 The response always contains exactly `tmdb` and `fanart` source keys, each
 reported as only `ready` or `failed`; missing Fanart credentials or an
 unverified Series TVDB identity report Fanart as `failed`.

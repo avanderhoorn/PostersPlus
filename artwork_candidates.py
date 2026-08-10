@@ -83,7 +83,7 @@ class _DetectionUnavailable(Exception):
 class CandidateRequest:
     media_type: str
     tmdb_id: str
-    imdb_id: str
+    imdb_id: str | None
     tvdb_id: str | None
 
 
@@ -235,15 +235,17 @@ def decode_request_body(body: bytes) -> CandidateRequest:
     except (UnicodeDecodeError, json.JSONDecodeError) as exc:
         raise CandidateDiscoveryError(400, "invalid_json", "Malformed JSON body") from exc
 
-    base_fields = {"schema_version", "type", "tmdb_id", "imdb_id"}
-    if not isinstance(value, dict) or set(value) not in (
-        base_fields,
-        base_fields | {"tvdb_id"},
+    required_fields = {"schema_version", "type", "tmdb_id"}
+    allowed_fields = required_fields | {"imdb_id", "tvdb_id"}
+    if (
+        not isinstance(value, dict)
+        or not required_fields <= set(value)
+        or not set(value) <= allowed_fields
     ):
         raise CandidateDiscoveryError(
             400,
             "invalid_schema",
-            "Body must contain exactly schema_version, type, tmdb_id, imdb_id, and optional tvdb_id",
+            "Body must contain schema_version, type, tmdb_id, and only optional imdb_id and tvdb_id",
         )
     if type(value["schema_version"]) is not int or value["schema_version"] != SCHEMA_VERSION:
         raise CandidateDiscoveryError(
@@ -253,13 +255,14 @@ def decode_request_body(body: bytes) -> CandidateRequest:
         )
     if value["type"] not in ("movie", "series"):
         raise CandidateDiscoveryError(400, "invalid_type", "type must be movie or series")
-    for field in ("tmdb_id", "imdb_id"):
-        if not isinstance(value[field], str):
-            raise CandidateDiscoveryError(400, "invalid_schema", f"{field} must be a string")
+    if not isinstance(value["tmdb_id"], str):
+        raise CandidateDiscoveryError(400, "invalid_schema", "tmdb_id must be a string")
     if not _TMDB_ID_RE.fullmatch(value["tmdb_id"]):
         raise CandidateDiscoveryError(400, "invalid_tmdb_id", "tmdb_id is malformed")
-    if not _IMDB_ID_RE.fullmatch(value["imdb_id"]):
-        raise CandidateDiscoveryError(400, "invalid_imdb_id", "imdb_id is malformed")
+    imdb_id = value.get("imdb_id")
+    if imdb_id is not None:
+        if not isinstance(imdb_id, str) or not _IMDB_ID_RE.fullmatch(imdb_id):
+            raise CandidateDiscoveryError(400, "invalid_imdb_id", "imdb_id is malformed")
     tvdb_id = value.get("tvdb_id")
     if tvdb_id is not None:
         if not isinstance(tvdb_id, str) or not _TVDB_ID_RE.fullmatch(tvdb_id):
@@ -267,7 +270,7 @@ def decode_request_body(body: bytes) -> CandidateRequest:
     return CandidateRequest(
         media_type=value["type"],
         tmdb_id=value["tmdb_id"],
-        imdb_id=value["imdb_id"],
+        imdb_id=imdb_id,
         tvdb_id=tvdb_id,
     )
 
@@ -458,13 +461,20 @@ async def _fetch_identity(
             "Provider identity verification returned malformed data",
         )
     external_ids = payload.get("external_ids")
-    if not isinstance(external_ids, dict):
+    if not isinstance(external_ids, dict) and (
+        request.imdb_id is not None or request.tvdb_id is not None
+    ):
         raise CandidateDiscoveryError(
             503,
             "identity_unavailable",
             "Provider identity verification returned malformed data",
         )
-    if external_ids.get("imdb_id") != request.imdb_id:
+    if not isinstance(external_ids, dict):
+        external_ids = {}
+    if (
+        request.imdb_id is not None
+        and external_ids.get("imdb_id") != request.imdb_id
+    ):
         raise CandidateDiscoveryError(
             400,
             "mixed_identity",

@@ -49,11 +49,11 @@ def _settings(**overrides):
     return candidates.DiscoverySettings(**values)
 
 
-def _request(media_type="movie", tvdb_id=None):
+def _request(media_type="movie", tvdb_id=None, imdb_id="tt1234567"):
     return candidates.CandidateRequest(
         media_type=media_type,
         tmdb_id="123",
-        imdb_id="tt1234567",
+        imdb_id=imdb_id,
         tvdb_id=tvdb_id,
     )
 
@@ -78,15 +78,41 @@ class StrictSchemaTests(unittest.TestCase):
         }).encode())
         self.assertIsNone(without_tvdb.tvdb_id)
 
+        tmdb_only = candidates.decode_request_body(json.dumps({
+            "schema_version": 1,
+            "type": "movie",
+            "tmdb_id": "123",
+        }).encode())
+        self.assertEqual(tmdb_only, _request(imdb_id=None))
+
+        explicit_nulls = candidates.decode_request_body(json.dumps({
+            "schema_version": 1,
+            "type": "series",
+            "tmdb_id": "123",
+            "imdb_id": None,
+            "tvdb_id": None,
+        }).encode())
+        self.assertEqual(explicit_nulls, _request("series", None, None))
+
+        tvdb_without_imdb = candidates.decode_request_body(json.dumps({
+            "schema_version": 1,
+            "type": "series",
+            "tmdb_id": "123",
+            "tvdb_id": "456",
+        }).encode())
+        self.assertEqual(tvdb_without_imdb, _request("series", "456", None))
+
     def test_rejects_duplicates_unknowns_and_malformed_values(self):
         invalid = (
             b'{"schema_version":1,"type":"movie","type":"series","tmdb_id":"123","imdb_id":"tt1"}',
             b'{"schema_version":1,"type":"movie","tmdb_id":"123","imdb_id":"tt1","limit":8}',
+            b'{"schema_version":1,"type":"movie","imdb_id":"tt1"}',
             b'{"schema_version":2,"type":"movie","tmdb_id":"123","imdb_id":"tt1"}',
             b'{"schema_version":1,"type":"tv","tmdb_id":"123","imdb_id":"tt1"}',
             b'{"schema_version":1,"type":"movie","tmdb_id":"0","imdb_id":"tt1"}',
             b'{"schema_version":1,"type":"movie","tmdb_id":"01","imdb_id":"tt1"}',
             b'{"schema_version":1,"type":"movie","tmdb_id":"123","imdb_id":"123"}',
+            b'{"schema_version":1,"type":"movie","tmdb_id":"123","imdb_id":123}',
             b'{"schema_version":1,"type":"series","tmdb_id":"123","imdb_id":"tt1","tvdb_id":"x"}',
             b'[]',
             b'not-json',
@@ -283,6 +309,48 @@ class AdapterTests(unittest.IsolatedAsyncioTestCase):
                 await candidates._fetch_identity(client, _request(), _settings())
         self.assertEqual(raised.exception.status_code, 400)
         self.assertEqual(raised.exception.code, "mixed_identity")
+
+    async def test_identity_allows_omitted_ids_but_checks_any_supplied_tvdb(self):
+        async def handler(_request):
+            return _json_response({
+                "id": 123,
+                "title": "Expected",
+                "original_title": "Expected",
+                "external_ids": {"imdb_id": "tt1234567", "tvdb_id": 456},
+            })
+
+        async with httpx.AsyncClient(transport=httpx.MockTransport(handler)) as client:
+            identity = await candidates._fetch_identity(
+                client,
+                _request(imdb_id=None),
+                _settings(),
+            )
+            self.assertFalse(identity.tvdb_verified)
+
+            with self.assertRaises(candidates.CandidateDiscoveryError) as raised:
+                await candidates._fetch_identity(
+                    client,
+                    _request("series", "999", None),
+                    _settings(),
+                )
+        self.assertEqual(raised.exception.code, "mixed_identity")
+
+    async def test_tmdb_only_identity_does_not_require_external_id_metadata(self):
+        async def handler(_request):
+            return _json_response({
+                "id": 123,
+                "title": "Expected",
+                "original_title": "Expected",
+            })
+
+        async with httpx.AsyncClient(transport=httpx.MockTransport(handler)) as client:
+            identity = await candidates._fetch_identity(
+                client,
+                _request(imdb_id=None),
+                _settings(),
+            )
+        self.assertEqual(identity.titles, ("Expected",))
+        self.assertFalse(identity.tvdb_verified)
 
 
 class ImageAndOcrTests(unittest.IsolatedAsyncioTestCase):
@@ -559,6 +627,46 @@ class DiscoveryPipelineTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(response["candidates"], [])
         self.assertEqual(outcome, "empty")
         self.assertEqual(cache_write.call_args.args[2], "empty")
+
+    async def test_tmdb_candidate_discovery_works_without_external_ids(self):
+        item = candidates.SourceCandidate(
+            "tmdb",
+            "https://image.tmdb.org/t/p/original/clean.jpg",
+            600,
+            900,
+            None,
+        )
+        with (
+            patch.object(
+                candidates,
+                "_fetch_identity",
+                AsyncMock(return_value=candidates._Identity(("Title",), False)),
+            ),
+            patch.object(candidates, "_tmdb_candidates", AsyncMock(return_value=[item])),
+            patch.object(candidates, "_fanart_candidates", AsyncMock(return_value=[])),
+            patch.object(candidates, "get_cached_artwork_candidates", return_value=None),
+            patch.object(candidates, "set_cached_artwork_candidates"),
+            patch.object(candidates, "text_detection_ready", return_value=True),
+            patch.object(
+                candidates,
+                "_fetch_screening_image",
+                AsyncMock(return_value=(
+                    b"clean",
+                    Image.new("RGBA", (600, 900), "black"),
+                    600,
+                    900,
+                )),
+            ),
+            patch.object(candidates, "_ocr_has_text", AsyncMock(return_value=False)),
+        ):
+            response, outcome = await candidates.discover_candidates(
+                Mock(),
+                _request(imdb_id=None),
+                settings=_settings(),
+            )
+        self.assertEqual(outcome, "complete")
+        self.assertEqual(len(response["candidates"]), 1)
+        self.assertEqual(response["candidates"][0]["source"], "tmdb")
 
     async def test_partial_source_failure_is_200_and_cached_briefly(self):
         item = candidates.SourceCandidate(
@@ -845,14 +953,15 @@ class CandidateCacheTests(unittest.TestCase):
 
 
 class EndpointContractTests(unittest.IsolatedAsyncioTestCase):
-    async def _post(self, headers=None, params=""):
+    async def _post(self, headers=None, params="", body=None):
         transport = httpx.ASGITransport(app=main.app)
-        body = {
-            "schema_version": 1,
-            "type": "movie",
-            "tmdb_id": "123",
-            "imdb_id": "tt1234567",
-        }
+        if body is None:
+            body = {
+                "schema_version": 1,
+                "type": "movie",
+                "tmdb_id": "123",
+                "imdb_id": "tt1234567",
+            }
         async with httpx.AsyncClient(
             transport=transport,
             base_url="http://test",
@@ -862,6 +971,46 @@ class EndpointContractTests(unittest.IsolatedAsyncioTestCase):
                 json=body,
                 headers=headers,
             )
+
+    async def test_endpoint_accepts_tmdb_only_and_explicit_nulls(self):
+        success = {
+            "schema_version": 1,
+            "sources": {"tmdb": "ready", "fanart": "failed"},
+            "candidates": [],
+        }
+        discover = AsyncMock(return_value=(success, "partial"))
+        with (
+            patch.object(main._cfg, "JELLYFIN_ARTWORK_DISCOVERY_KEY", "discover"),
+            patch.object(main._cfg, "ACCESS_KEY", "render"),
+            patch.object(main, "_HTTP_CLIENT", Mock()),
+            patch.object(main, "discover_candidates", discover),
+        ):
+            tmdb_only = await self._post(
+                {"X-Jellyfin-Artwork-Discovery-Key": "discover"},
+                body={
+                    "schema_version": 1,
+                    "type": "movie",
+                    "tmdb_id": "123",
+                },
+            )
+            explicit_nulls = await self._post(
+                {"X-Jellyfin-Artwork-Discovery-Key": "discover"},
+                body={
+                    "schema_version": 1,
+                    "type": "series",
+                    "tmdb_id": "123",
+                    "imdb_id": None,
+                    "tvdb_id": None,
+                },
+            )
+        self.assertEqual(tmdb_only.status_code, 200)
+        self.assertEqual(explicit_nulls.status_code, 200)
+        first_request = discover.await_args_list[0].args[1]
+        second_request = discover.await_args_list[1].args[1]
+        self.assertIsNone(first_request.imdb_id)
+        self.assertIsNone(first_request.tvdb_id)
+        self.assertIsNone(second_request.imdb_id)
+        self.assertIsNone(second_request.tvdb_id)
 
     async def test_discovery_auth_is_separate_from_render_auth(self):
         success = {
