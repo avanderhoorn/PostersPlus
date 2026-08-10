@@ -624,6 +624,7 @@ from artwork_candidates import (
     decode_request_body as decode_candidate_request_body,
     discover_candidates,
     discovery_key_matches,
+    effective_discovery_key,
     shutdown_candidate_ocr_executor,
 )
 
@@ -775,11 +776,12 @@ def _resolve_anime_request(
 def _access_key_matches(candidate: str) -> bool:
     if not _cfg.ACCESS_KEY:
         return False
+    discovery_key = effective_discovery_key()
     if (
-        _cfg.JELLYFIN_ARTWORK_DISCOVERY_KEY
+        discovery_key
         and hmac.compare_digest(
             candidate.encode("utf-8"),
-            _cfg.JELLYFIN_ARTWORK_DISCOVERY_KEY.encode("utf-8"),
+            discovery_key.encode("utf-8"),
         )
     ):
         return False

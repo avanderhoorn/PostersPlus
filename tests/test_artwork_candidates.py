@@ -1,5 +1,7 @@
 import asyncio
 import gzip
+import hashlib
+import hmac
 import io
 import json
 import logging
@@ -1390,6 +1392,45 @@ class CandidateCacheTests(unittest.TestCase):
         self.assertEqual(row[1], "complete")
 
 
+class DiscoveryCredentialTests(unittest.TestCase):
+    def test_unset_explicit_key_derives_domain_separated_hmac(self):
+        expected = hmac.new(
+            b"render-secret",
+            b"jellyfin-artwork-discovery-v1",
+            hashlib.sha256,
+        ).hexdigest()
+        with (
+            patch.object(main._cfg, "ACCESS_KEY", "render-secret"),
+            patch.object(main._cfg, "JELLYFIN_ARTWORK_DISCOVERY_KEY", ""),
+        ):
+            self.assertEqual(candidates.effective_discovery_key(), expected)
+            self.assertTrue(candidates.discovery_key_matches(expected))
+            self.assertFalse(candidates.discovery_key_matches("render-secret"))
+            self.assertTrue(main._access_key_matches("render-secret"))
+            self.assertFalse(main._access_key_matches(expected))
+
+    def test_explicit_key_overrides_derivation_and_supports_standalone(self):
+        derived = hmac.new(
+            b"render-secret",
+            b"jellyfin-artwork-discovery-v1",
+            hashlib.sha256,
+        ).hexdigest()
+        with (
+            patch.object(main._cfg, "ACCESS_KEY", "render-secret"),
+            patch.object(main._cfg, "JELLYFIN_ARTWORK_DISCOVERY_KEY", "dedicated"),
+        ):
+            self.assertEqual(candidates.effective_discovery_key(), "dedicated")
+            self.assertTrue(candidates.discovery_key_matches("dedicated"))
+            self.assertFalse(candidates.discovery_key_matches(derived))
+
+        with (
+            patch.object(main._cfg, "ACCESS_KEY", None),
+            patch.object(main._cfg, "JELLYFIN_ARTWORK_DISCOVERY_KEY", "standalone"),
+        ):
+            self.assertEqual(candidates.effective_discovery_key(), "standalone")
+            self.assertTrue(candidates.discovery_key_matches("standalone"))
+
+
 class EndpointContractTests(unittest.IsolatedAsyncioTestCase):
     async def _post(self, headers=None, params="", body=None):
         transport = httpx.ASGITransport(app=main.app)
@@ -1493,6 +1534,48 @@ class EndpointContractTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(render_key.status_code, 403)
         self.assertEqual(query_key.status_code, 403)
         self.assertEqual(render_route.status_code, 403)
+
+    async def test_derived_discovery_key_cannot_authenticate_render_routes(self):
+        success = {
+            "schema_version": 1,
+            "sources": {"tmdb": "ready", "fanart": "failed"},
+            "candidates": [],
+        }
+        derived = hmac.new(
+            b"render-secret",
+            b"jellyfin-artwork-discovery-v1",
+            hashlib.sha256,
+        ).hexdigest()
+        with (
+            patch.object(main._cfg, "JELLYFIN_ARTWORK_DISCOVERY_KEY", ""),
+            patch.object(main._cfg, "ACCESS_KEY", "render-secret"),
+            patch.object(main, "_HTTP_CLIENT", Mock()),
+            patch.object(main, "_text_detector_ready", return_value=True),
+            patch.object(
+                main,
+                "discover_candidates",
+                AsyncMock(return_value=(success, "partial")),
+            ),
+        ):
+            discovery = await self._post({
+                "X-Jellyfin-Artwork-Discovery-Key": derived,
+            })
+            transport = httpx.ASGITransport(app=main.app)
+            async with httpx.AsyncClient(
+                transport=transport,
+                base_url="http://test",
+            ) as client:
+                render_with_access = await client.get(
+                    "/ready",
+                    headers={"X-Jellyfin-Artwork-Key": "render-secret"},
+                )
+                render_with_derived = await client.get(
+                    "/ready",
+                    headers={"X-Jellyfin-Artwork-Key": derived},
+                )
+        self.assertEqual(discovery.status_code, 200)
+        self.assertEqual(render_with_access.status_code, 200)
+        self.assertEqual(render_with_derived.status_code, 403)
 
     async def test_discovery_auth_is_enforced_with_asgi_root_path(self):
         success = {

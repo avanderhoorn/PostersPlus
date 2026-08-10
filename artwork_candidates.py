@@ -47,6 +47,7 @@ OCR_TITLE_POLICY_REVISION = "normalized-titles-v1"
 RANKING_REVISION = "source-alternation-v1"
 RESULT_CACHE_TTL_SECONDS = 24 * 60 * 60
 PARTIAL_CACHE_TTL_SECONDS = 15 * 60
+DISCOVERY_KEY_DERIVATION_MESSAGE = b"jellyfin-artwork-discovery-v1"
 
 _TMDB_ID_RE = re.compile(r"^[1-9]\d{0,9}$")
 _TVDB_ID_RE = re.compile(r"^[1-9]\d{0,9}$")
@@ -256,8 +257,21 @@ def shutdown_candidate_ocr_executor() -> None:
     _ocr_worker.shutdown()
 
 
+def effective_discovery_key() -> str:
+    explicit = _cfg.JELLYFIN_ARTWORK_DISCOVERY_KEY
+    if explicit:
+        return explicit
+    if not _cfg.ACCESS_KEY:
+        return ""
+    return hmac.new(
+        _cfg.ACCESS_KEY.encode("utf-8"),
+        DISCOVERY_KEY_DERIVATION_MESSAGE,
+        hashlib.sha256,
+    ).hexdigest()
+
+
 def discovery_key_matches(candidate: str) -> bool:
-    configured = _cfg.JELLYFIN_ARTWORK_DISCOVERY_KEY
+    configured = effective_discovery_key()
     if not configured:
         return False
     if _cfg.ACCESS_KEY and hmac.compare_digest(configured, _cfg.ACCESS_KEY):

@@ -145,7 +145,7 @@ All configuration is done via environment variables. Copy `.env.example` to `.en
 | `TVDB_NEG_CACHE_DURATION` | `3` | Days to cache a "no TVDB match / no art" result, so newly-added TVDB art is picked up sooner than a positive match |
 | `TVDB_TYPES_CACHE_DURATION` | `30` | Days to cache the TVDB artwork-type catalogue, which rarely changes |
 | `ACCESS_KEY` | - | Shared secret accepted in `X-Jellyfin-Artwork-Key`; legacy routes also accept `access_key` in the query unless header-only mode is enabled |
-| `JELLYFIN_ARTWORK_DISCOVERY_KEY` | - | Dedicated header-only secret for `POST /v1/artwork/candidates`. It must differ from `ACCESS_KEY` and is never accepted by render routes |
+| `JELLYFIN_ARTWORK_DISCOVERY_KEY` | derived from `ACCESS_KEY` | Optional explicit header-only secret for `POST /v1/artwork/candidates`. When unset, the key is `HMAC-SHA256(ACCESS_KEY, "jellyfin-artwork-discovery-v1").hexdigest()`. It must differ from `ACCESS_KEY` and is never accepted by render routes |
 | `JELLYFIN_ARTWORK_FANART_PROJECT_API_KEY` | - | Fanart.tv v3 PostersPlus application key, sent only as Fanart's `api_key` metadata parameter |
 | `JELLYFIN_ARTWORK_FANART_CLIENT_KEY` | - | Fanart.tv v3 operator key, sent only as Fanart's `client_key` metadata parameter |
 | `HEADER_ONLY_AUTH` | `false` | Require header authentication globally. `/health` and static configurator assets remain anonymous; `/render/selected` and `/render/selection` are always header-only |
@@ -368,6 +368,13 @@ If you only want MyAnimeList *scores* on anime that already has an IMDb id, you 
 operation for Jellyfin's **Homestack Clean Artwork** provider. It requires
 `X-Jellyfin-Artwork-Discovery-Key`; `X-Jellyfin-Artwork-Key` and query-string
 credentials are rejected.
+
+For integrated deployments, leave `JELLYFIN_ARTWORK_DISCOVERY_KEY` unset and
+derive the header value as the lowercase hexadecimal
+`HMAC-SHA256(key=ACCESS_KEY bytes, message="jellyfin-artwork-discovery-v1")`.
+An explicit dedicated key remains supported for standalone deployments and
+overrides derivation. Either form is domain-separated from render auth and
+cannot authenticate render routes.
 
 ```bash
 curl --fail-with-body \
