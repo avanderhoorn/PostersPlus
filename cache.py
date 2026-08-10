@@ -262,6 +262,15 @@ def init_db() -> None:
         )
     """)
 
+    conn.execute("""
+        CREATE TABLE IF NOT EXISTS artwork_candidate_cache (
+            cache_key    TEXT PRIMARY KEY,
+            response_json TEXT NOT NULL,
+            result_class TEXT NOT NULL,
+            cached_at    INTEGER NOT NULL
+        )
+    """)
+
     # Small generic key/value store for app-level bookkeeping (e.g. the last
     # cache-warm cycle's timestamp) that doesn't warrant its own table.
     conn.execute("""
@@ -513,6 +522,7 @@ def get_cache_stats() -> dict:
             "tmdb_metadata_cache", "final_poster_cache",
             "digital_release_cache", "release_status_cache",
             "movie_release_info_cache", "text_detection_cache",
+            "artwork_candidate_cache",
         ):
             try:
                 (n,) = db.execute(f"SELECT COUNT(*) FROM {table}").fetchone()
@@ -617,6 +627,13 @@ def prune_caches() -> None:
             )
             if r.rowcount:
                 logger.info(f"Pruned {r.rowcount} old text-detection cache entries")
+
+            r = db.execute(
+                "DELETE FROM artwork_candidate_cache WHERE cached_at < ?",
+                (now - 24 * 60 * 60,),
+            )
+            if r.rowcount:
+                logger.info(f"Pruned {r.rowcount} expired artwork-candidate entries")
 
             # Each tvdb_cache row stores its own TTL, so expiry is per-row rather
             # than a single cutoff.
@@ -1514,6 +1531,64 @@ def set_cached_text_detection(cache_key: str, has_text: bool) -> None:
             get_db().commit()
     except Exception as exc:
         logger.error(f"Text-detection cache write error: {exc}")
+
+
+def get_cached_artwork_candidates(
+    cache_key: str,
+    *,
+    complete_ttl: int,
+    partial_ttl: int,
+) -> dict | None:
+    """Return a fresh successful candidate response, or None."""
+    try:
+        row = get_db().execute(
+            """
+            SELECT response_json, result_class, cached_at
+            FROM artwork_candidate_cache
+            WHERE cache_key = ?
+            """,
+            (cache_key,),
+        ).fetchone()
+        if row is None:
+            return None
+        ttl = partial_ttl if row[1] == "partial" else complete_ttl
+        if row[1] not in ("complete", "empty", "partial"):
+            return None
+        if int(time.time()) - int(row[2]) >= max(0, ttl):
+            return None
+        value = json.loads(row[0])
+        return value if isinstance(value, dict) else None
+    except Exception as exc:
+        logger.error(f"Artwork-candidate cache read error: {exc}")
+        return None
+
+
+def set_cached_artwork_candidates(
+    cache_key: str,
+    response: dict,
+    result_class: str,
+) -> None:
+    """Cache only complete, empty, or partial successful searches."""
+    if result_class not in ("complete", "empty", "partial"):
+        raise ValueError("invalid artwork-candidate result class")
+    payload = json.dumps(response, sort_keys=True, separators=(",", ":"))
+    try:
+        with _db_lock:
+            get_db().execute(
+                """
+                INSERT INTO artwork_candidate_cache
+                    (cache_key, response_json, result_class, cached_at)
+                VALUES (?, ?, ?, ?)
+                ON CONFLICT(cache_key) DO UPDATE SET
+                    response_json=excluded.response_json,
+                    result_class=excluded.result_class,
+                    cached_at=excluded.cached_at
+                """,
+                (cache_key, payload, result_class, int(time.time())),
+            )
+            get_db().commit()
+    except Exception as exc:
+        logger.error(f"Artwork-candidate cache write error: {exc}")
 
 
 # ---------------------------------------------------------------------------

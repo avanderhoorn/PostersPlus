@@ -145,6 +145,9 @@ All configuration is done via environment variables. Copy `.env.example` to `.en
 | `TVDB_NEG_CACHE_DURATION` | `3` | Days to cache a "no TVDB match / no art" result, so newly-added TVDB art is picked up sooner than a positive match |
 | `TVDB_TYPES_CACHE_DURATION` | `30` | Days to cache the TVDB artwork-type catalogue, which rarely changes |
 | `ACCESS_KEY` | - | Shared secret accepted in `X-Jellyfin-Artwork-Key`; legacy routes also accept `access_key` in the query unless header-only mode is enabled |
+| `JELLYFIN_ARTWORK_DISCOVERY_KEY` | - | Dedicated header-only secret for `POST /v1/artwork/candidates`. It must differ from `ACCESS_KEY` and is never accepted by render routes |
+| `JELLYFIN_ARTWORK_FANART_PROJECT_API_KEY` | - | Fanart.tv v3 PostersPlus application key, sent only as Fanart's `api_key` metadata parameter |
+| `JELLYFIN_ARTWORK_FANART_CLIENT_KEY` | - | Fanart.tv v3 operator key, sent only as Fanart's `client_key` metadata parameter |
 | `HEADER_ONLY_AUTH` | `false` | Require header authentication globally. `/health` and static configurator assets remain anonymous; `/render/selected` and `/render/selection` are always header-only |
 | `RENDER_PROFILE_PATH` | - | Path to one read-only mounted YAML render profile (see `profile.example.yml`) |
 | `POSTERSPLUS_SOURCE_REVISION` | `unknown` | Exact source commit reported by `/ready`; release images set this automatically |
@@ -358,6 +361,33 @@ What changes on this path:
 - **Sashes** are limited to what the provider knows: lifecycle status (airing / ended / cancelled) works; awards, trending, digital-release and cinema status do not, because those are TMDB/MDBList lookups with nothing to match against.
 
 If you only want MyAnimeList *scores* on anime that already has an IMDb id, you don't need any of this — MDBList already returns a `myanimelist` rating, so just give that source a non-zero weight.
+
+### Clean Primary candidate discovery
+
+`POST /v1/artwork/candidates` is the renderer's bounded, discovery-only
+operation for Jellyfin's **Homestack Clean Artwork** provider. It requires
+`X-Jellyfin-Artwork-Discovery-Key`; `X-Jellyfin-Artwork-Key` and query-string
+credentials are rejected.
+
+```bash
+curl --fail-with-body \
+  -H "X-Jellyfin-Artwork-Discovery-Key: $JELLYFIN_ARTWORK_DISCOVERY_KEY" \
+  -H "Content-Type: application/json" \
+  --data '{"schema_version":1,"type":"movie","tmdb_id":"123","imdb_id":"tt1234567"}' \
+  http://postersplus:8000/v1/artwork/candidates
+```
+
+The exact schema accepts `type` (`movie` or `series`), string TMDb and IMDb
+IDs, and an optional string TVDB ID. PostersPlus verifies the identities,
+queries TMDb and optionally Fanart.tv, screens bounded portrait bytes with one
+OCR worker, deduplicates exact bytes, alternates source-ranked results, and
+returns at most eight credential-free HTTPS URLs from `image.tmdb.org` or
+`assets.fanart.tv`. Series Fanart results require a verified TVDB ID.
+
+Successful complete or empty searches cache for 24 hours; partial-source
+results cache for 15 minutes. Detection uncertainty, deadline failures, and
+all-source failures return 503 and are not cached. Every response uses
+`Cache-Control: no-store`; there is no title-bearing fallback.
 
 ### Private selected-image renderer
 

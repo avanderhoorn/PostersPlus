@@ -54,7 +54,7 @@ class _TruncateUrlFilter(logging.Filter):
     # Match query params we hold (tmdb_key, mdblist_key, access_key) AND the
     # upstream parameter names we forward keys under (api_key, apikey).
     _KEY_RE = re.compile(
-        r'((?:tmdb_key|mdblist_key|access_key|api_key|apikey)=)[^&\s\'\"]*',
+        r'((?:tmdb_key|mdblist_key|access_key|api_key|apikey|client_key)=)[^&\s\'\"]*',
         re.IGNORECASE,
     )
 
@@ -74,6 +74,8 @@ class _TruncateUrlFilter(logging.Filter):
             path = record.args[2]
             if isinstance(path, str):
                 path = self._KEY_RE.sub(r'\1***', path)
+                if path.startswith("/v1/artwork/candidates?"):
+                    path = "/v1/artwork/candidates?<redacted>"
                 if len(path) > self._MAX:
                     path = path[: self._MAX] + "…"
                 record.args = (record.args[0], record.args[1], path) + record.args[3:]
@@ -615,6 +617,14 @@ from ratings import (
     _score_color_metal,
 )
 from tmdb import composite_logo, logo_centre_y, fetch_logo, image_language_order, fetch_poster_metadata, fetch_poster_image, fetch_backdrop_image, fetch_trending_rank, fetch_trending_candidates, fetch_popular_candidates, fetch_supplemental_candidates, fetch_catalog_candidates, fetch_release_status, fetch_recent_movie_digital_release_date, svg_logo_supported, tmdb_metadata_cache_key, _CROP_VERSION, _fetch_metahub_logo, LOGO_ABS_MAX_H, TEXT_FORWARD_PRIORITIES as _TEXT_FORWARD_LOGO_PRIORITIES
+from artwork_candidates import (
+    CandidateDiscoveryError,
+    MAX_BODY_BYTES as CANDIDATE_MAX_BODY_BYTES,
+    decode_request_body as decode_candidate_request_body,
+    discover_candidates,
+    discovery_key_matches,
+    shutdown_candidate_ocr_executor,
+)
 
 # Logo priorities that consult the secondary preferred language ("custom").
 # Elsewhere the secondary language is inert and must be kept out of the image
@@ -763,6 +773,14 @@ def _resolve_anime_request(
 
 def _access_key_matches(candidate: str) -> bool:
     if not _cfg.ACCESS_KEY:
+        return False
+    if (
+        _cfg.JELLYFIN_ARTWORK_DISCOVERY_KEY
+        and hmac.compare_digest(
+            candidate.encode("utf-8"),
+            _cfg.JELLYFIN_ARTWORK_DISCOVERY_KEY.encode("utf-8"),
+        )
+    ):
         return False
     return hmac.compare_digest(
         candidate.encode("utf-8"),
@@ -3115,6 +3133,7 @@ async def lifespan(app: FastAPI):
     _background_detection_queue = None
     _background_detection_keys.clear()
     _shutdown_detect_executor()
+    shutdown_candidate_ocr_executor()
     await _HTTP_CLIENT.aclose()
     logger.info("HTTP client closed")
 
@@ -3133,6 +3152,24 @@ async def _selection_error_response(_request: Request, exc: _SelectionError):
             }
         },
     )
+
+
+@app.exception_handler(CandidateDiscoveryError)
+async def _candidate_error_response(_request: Request, exc: CandidateDiscoveryError):
+    logger.warning("Artwork discovery rejected: reason=%s", exc.code)
+    response = JSONResponse(
+        status_code=exc.status_code,
+        content={
+            "error": {
+                "code": exc.code,
+                "message": exc.message,
+            }
+        },
+    )
+    response.headers["Cache-Control"] = "no-store"
+    if exc.status_code == 429:
+        response.headers["Retry-After"] = "60"
+    return response
 
 
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))
@@ -3187,12 +3224,22 @@ app.mount("/static", StaticFiles(directory=os.path.join(BASE_DIR, "static")), na
 
 @app.middleware("http")
 async def authenticate_and_harden(request: Request, call_next):
+    discovery_path = request.url.path == "/v1/artwork/candidates"
     anonymous_path = (
         request.url.path == "/health"
         or request.url.path == "/static"
         or request.url.path.startswith("/static/")
     )
-    if not anonymous_path and _cfg.ACCESS_KEY:
+    if discovery_path:
+        discovery_key = request.headers.get(
+            "x-jellyfin-artwork-discovery-key", ""
+        )
+        if not discovery_key_matches(discovery_key):
+            response = JSONResponse(status_code=403, content={"detail": "Unauthorized"})
+            response.headers["Cache-Control"] = "no-store"
+            response.headers["server"] = "unknown"
+            return response
+    elif not anonymous_path and _cfg.ACCESS_KEY:
         header_key = request.headers.get("x-jellyfin-artwork-key", "")
         query_key = request.query_params.get("access_key", "")
         header_valid = _access_key_matches(header_key)
@@ -3205,6 +3252,8 @@ async def authenticate_and_harden(request: Request, call_next):
             response.headers["server"] = "unknown"
             return response
     response = await call_next(request)
+    if discovery_path:
+        response.headers["Cache-Control"] = "no-store"
     response.headers["server"] = "unknown"
     return response
 
@@ -3352,6 +3401,56 @@ async def readiness():
 def _text_detector_ready() -> bool:
     from text_detect import text_detection_ready
     return text_detection_ready()
+
+
+@app.post("/v1/artwork/candidates")
+async def artwork_candidates(request: Request):
+    if request.query_params:
+        raise CandidateDiscoveryError(
+            400,
+            "invalid_query",
+            "Artwork discovery does not accept query parameters",
+        )
+    content_type = request.headers.get("content-type", "")
+    if content_type.split(";", 1)[0].strip().lower() != "application/json":
+        raise CandidateDiscoveryError(
+            415,
+            "invalid_content_type",
+            "Content-Type must be application/json",
+        )
+    try:
+        body = await _read_bounded_body(
+            request,
+            max_bytes=CANDIDATE_MAX_BODY_BYTES,
+            empty_message="Artwork discovery body is empty",
+            too_large_message="Artwork discovery body is too large",
+        )
+    except HTTPException as exc:
+        raise CandidateDiscoveryError(
+            exc.status_code,
+            "body_too_large" if exc.status_code == 413 else "invalid_body",
+            str(exc.detail),
+        ) from exc
+    candidate_request = decode_candidate_request_body(body)
+    if _HTTP_CLIENT is None:
+        raise CandidateDiscoveryError(
+            503,
+            "service_unavailable",
+            "Artwork discovery is not ready",
+        )
+    response, outcome = await discover_candidates(
+        _HTTP_CLIENT,
+        candidate_request,
+    )
+    logger.info(
+        "Artwork discovery complete: type=%s tmdb=%s fanart=%s count=%d outcome=%s",
+        candidate_request.media_type,
+        response["sources"].get("tmdb", "unknown"),
+        response["sources"].get("fanart", "unknown"),
+        len(response["candidates"]),
+        outcome,
+    )
+    return JSONResponse(content=response)
 
 
 @app.get("/stats")
