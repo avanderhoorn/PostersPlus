@@ -1,4 +1,4 @@
-"""Bounded clean Primary artwork discovery for Jellyfin."""
+"""Bounded clean Primary and typed Logo artwork discovery for Jellyfin."""
 from __future__ import annotations
 
 import asyncio
@@ -32,6 +32,11 @@ from text_detect import DETECT_RES_SIG, poster_has_burned_in_text, text_detectio
 
 
 SCHEMA_VERSION = 1
+SCHEMA_VERSION_TYPED = 2
+SUPPORTED_SCHEMA_VERSIONS = (SCHEMA_VERSION, SCHEMA_VERSION_TYPED)
+IMAGE_TYPE_PRIMARY = "Primary"
+IMAGE_TYPE_LOGO = "Logo"
+SUPPORTED_IMAGE_TYPES = (IMAGE_TYPE_PRIMARY, IMAGE_TYPE_LOGO)
 MAX_BODY_BYTES = 4096
 MAX_ENUMERATED_PER_SOURCE = 8
 MAX_OCR_ATTEMPTS = 16
@@ -42,8 +47,11 @@ MAX_SEARCH_STARTS_PER_MINUTE = 30
 METADATA_MAX_BYTES = 2 * 1024 * 1024
 MIN_PORTRAIT_ASPECT = 0.55
 MAX_PORTRAIT_ASPECT = 0.80
+MIN_LANDSCAPE_ASPECT = 1.20
+MAX_LANDSCAPE_ASPECT = 12.0
 OCR_POLICY_REVISION = "clean-primary-v1"
 OCR_TITLE_POLICY_REVISION = "normalized-titles-v1"
+LOGO_SCREENING_REVISION = "logo-no-ocr-v1"
 RANKING_REVISION = "source-alternation-v1"
 RESULT_CACHE_TTL_SECONDS = 24 * 60 * 60
 PARTIAL_CACHE_TTL_SECONDS = 15 * 60
@@ -54,6 +62,19 @@ _TVDB_ID_RE = re.compile(r"^[1-9]\d{0,9}$")
 _IMDB_ID_RE = re.compile(r"^tt\d{1,10}$")
 _TMDB_FILE_RE = re.compile(r"^/[A-Za-z0-9_-]+\.(?:jpe?g|png|webp)$", re.IGNORECASE)
 _FANART_FILE_RE = re.compile(r"^[A-Za-z0-9_-]+\.(?:jpe?g|png|webp)$", re.IGNORECASE)
+# Fanart resource path segments the discovery pipeline trusts. Poster segments
+# feed Primary discovery; the logo segments feed Logo discovery and are ordered
+# HD/logo-specific first so higher-quality artwork ranks ahead of fallbacks.
+_FANART_MOVIE_POSTER_RESOURCE = "movieposter"
+_FANART_TV_POSTER_RESOURCE = "tvposter"
+_FANART_MOVIE_LOGO_RESOURCES = ("hdmovielogo", "movielogo")
+_FANART_TV_LOGO_RESOURCES = ("hdtvlogo", "clearlogo")
+_FANART_MOVIE_RESOURCES = frozenset(
+    (_FANART_MOVIE_POSTER_RESOURCE, *_FANART_MOVIE_LOGO_RESOURCES)
+)
+_FANART_TV_RESOURCES = frozenset(
+    (_FANART_TV_POSTER_RESOURCE, *_FANART_TV_LOGO_RESOURCES)
+)
 _IMAGE_CONTENT_TYPES = {
     "image/jpeg": "JPEG",
     "image/png": "PNG",
@@ -93,6 +114,12 @@ class CandidateRequest:
     tmdb_id: str
     imdb_id: str | None
     tvdb_id: str | None
+    schema_version: int = SCHEMA_VERSION
+    image_type: str = IMAGE_TYPE_PRIMARY
+
+    @property
+    def is_logo(self) -> bool:
+        return self.image_type == IMAGE_TYPE_LOGO
 
 
 @dataclass(frozen=True)
@@ -107,6 +134,8 @@ class SourceCandidate:
     likes: int = 0
     ordinal: int = 0
     sha256: str | None = None
+    tier: int = 0
+    image_type: str = IMAGE_TYPE_PRIMARY
 
     def response_value(self) -> dict[str, Any]:
         return {
@@ -305,24 +334,39 @@ def decode_request_body(body: bytes) -> CandidateRequest:
     except (UnicodeDecodeError, json.JSONDecodeError) as exc:
         raise CandidateDiscoveryError(400, "invalid_json", "Malformed JSON body") from exc
 
-    required_fields = {"schema_version", "type", "tmdb_id"}
-    allowed_fields = required_fields | {"imdb_id", "tvdb_id"}
     if (
         not isinstance(value, dict)
-        or not required_fields <= set(value)
-        or not set(value) <= allowed_fields
+        or "schema_version" not in value
+        or type(value["schema_version"]) is not int
+        or value["schema_version"] not in SUPPORTED_SCHEMA_VERSIONS
     ):
         raise CandidateDiscoveryError(
             400,
-            "invalid_schema",
-            "Body must contain schema_version, type, tmdb_id, and only optional imdb_id and tvdb_id",
+            "unsupported_schema",
+            "schema_version must be 1 or 2",
         )
-    if type(value["schema_version"]) is not int or value["schema_version"] != SCHEMA_VERSION:
+    schema_version = value["schema_version"]
+    if schema_version == SCHEMA_VERSION_TYPED:
+        required_fields = {"schema_version", "type", "tmdb_id", "image_type"}
+    else:
+        required_fields = {"schema_version", "type", "tmdb_id"}
+    allowed_fields = required_fields | {"imdb_id", "tvdb_id"}
+    if not required_fields <= set(value) or not set(value) <= allowed_fields:
         raise CandidateDiscoveryError(
             400,
-            "unsupported_schema",
-            "schema_version must be 1",
+            "invalid_schema",
+            "Body fields do not match the requested schema_version",
         )
+    if schema_version == SCHEMA_VERSION_TYPED:
+        image_type = value["image_type"]
+        if type(image_type) is not str or image_type not in SUPPORTED_IMAGE_TYPES:
+            raise CandidateDiscoveryError(
+                400,
+                "invalid_image_type",
+                "image_type must be Primary or Logo",
+            )
+    else:
+        image_type = IMAGE_TYPE_PRIMARY
     if value["type"] not in ("movie", "series"):
         raise CandidateDiscoveryError(400, "invalid_type", "type must be movie or series")
     if not isinstance(value["tmdb_id"], str):
@@ -348,6 +392,8 @@ def decode_request_body(body: bytes) -> CandidateRequest:
         tmdb_id=value["tmdb_id"],
         imdb_id=imdb_id,
         tvdb_id=tvdb_id,
+        schema_version=schema_version,
+        image_type=image_type,
     )
 
 
@@ -378,6 +424,19 @@ def _is_portrait(width: int, height: int) -> bool:
         return False
     aspect = width / height
     return MIN_PORTRAIT_ASPECT <= aspect <= MAX_PORTRAIT_ASPECT
+
+
+def _is_landscape(width: int, height: int) -> bool:
+    if width <= 0 or height <= 0 or width <= height:
+        return False
+    aspect = width / height
+    return MIN_LANDSCAPE_ASPECT <= aspect <= MAX_LANDSCAPE_ASPECT
+
+
+def _has_useful_aspect(width: int, height: int, image_type: str) -> bool:
+    if image_type == IMAGE_TYPE_LOGO:
+        return _is_landscape(width, height)
+    return _is_portrait(width, height)
 
 
 def _validate_base_url(url: str, expected_host: str) -> str:
@@ -424,14 +483,21 @@ def canonical_fanart_url(
     media_type: str,
     tmdb_id: str,
     tvdb_id: str | None,
+    resource: str | None = None,
 ) -> str:
     path = _validate_base_url(url, "assets.fanart.tv")
     if media_type == "movie":
-        prefix = f"/fanart/movies/{tmdb_id}/movieposter/"
+        segment = resource or _FANART_MOVIE_POSTER_RESOURCE
+        if segment not in _FANART_MOVIE_RESOURCES:
+            raise _CandidateRejected()
+        prefix = f"/fanart/movies/{tmdb_id}/{segment}/"
     else:
         if tvdb_id is None:
             raise _CandidateRejected()
-        prefix = f"/fanart/tv/{tvdb_id}/tvposter/"
+        segment = resource or _FANART_TV_POSTER_RESOURCE
+        if segment not in _FANART_TV_RESOURCES:
+            raise _CandidateRejected()
+        prefix = f"/fanart/tv/{tvdb_id}/{segment}/"
     if not path.startswith(prefix):
         raise _CandidateRejected()
     filename = path[len(prefix):]
@@ -705,10 +771,150 @@ async def _fanart_candidates(
     return candidates[:MAX_ENUMERATED_PER_SOURCE]
 
 
+async def _tmdb_logo_candidates(
+    client: httpx.AsyncClient,
+    request: CandidateRequest,
+    settings: DiscoverySettings,
+) -> list[SourceCandidate]:
+    endpoint = "movie" if request.media_type == "movie" else "tv"
+    payload = await _get_json(
+        client,
+        f"https://api.themoviedb.org/3/{endpoint}/{request.tmdb_id}/images",
+        {
+            "api_key": settings.tmdb_api_key,
+            "include_image_language": "en,null",
+        },
+    )
+    if not isinstance(payload, dict) or not isinstance(payload.get("logos"), list):
+        raise _SourceFailure("malformed_response")
+    candidates = []
+    for ordinal, item in enumerate(payload["logos"]):
+        if not isinstance(item, dict):
+            continue
+        try:
+            url = canonical_tmdb_url(item.get("file_path"))
+        except _CandidateRejected:
+            continue
+        width = _safe_int(item.get("width"))
+        height = _safe_int(item.get("height"))
+        if not _is_landscape(width, height):
+            continue
+        language = item.get("iso_639_1")
+        candidates.append(
+            SourceCandidate(
+                source="tmdb",
+                url=url,
+                width=width,
+                height=height,
+                language=language if isinstance(language, str) and language else None,
+                rating=_safe_float(item.get("vote_average")),
+                votes=_safe_int(item.get("vote_count")),
+                ordinal=ordinal,
+                image_type=IMAGE_TYPE_LOGO,
+            )
+        )
+    candidates.sort(
+        key=lambda item: (
+            -(item.width * item.height),
+            -item.rating,
+            -item.votes,
+            item.ordinal,
+        )
+    )
+    return candidates[:MAX_ENUMERATED_PER_SOURCE]
+
+
+async def _fanart_logo_candidates(
+    client: httpx.AsyncClient,
+    request: CandidateRequest,
+    identity: _Identity,
+    settings: DiscoverySettings,
+) -> list[SourceCandidate]:
+    if request.media_type == "series" and not identity.tvdb_verified:
+        return []
+    if request.media_type == "movie":
+        path = f"movies/{request.tmdb_id}"
+        resources = _FANART_MOVIE_LOGO_RESOURCES
+    else:
+        path = f"tv/{request.tvdb_id}"
+        resources = _FANART_TV_LOGO_RESOURCES
+    payload = await _get_json(
+        client,
+        f"https://webservice.fanart.tv/v3/{path}",
+        {
+            "api_key": settings.fanart_project_api_key,
+            "client_key": settings.fanart_client_key,
+        },
+    )
+    if not isinstance(payload, dict):
+        raise _SourceFailure("malformed_response")
+    candidates = []
+    seen_urls: set[str] = set()
+    ordinal = 0
+    # HD/logo-specific resources come first so they win ranking ties over the
+    # lower-quality fallbacks; the resource tier is preserved on each candidate.
+    for tier, field in enumerate(resources):
+        values = payload.get(field, [])
+        if not isinstance(values, list):
+            if field in payload:
+                raise _SourceFailure("malformed_response")
+            continue
+        for item in values:
+            if not isinstance(item, dict):
+                continue
+            try:
+                url = canonical_fanart_url(
+                    item.get("url"),
+                    media_type=request.media_type,
+                    tmdb_id=request.tmdb_id,
+                    tvdb_id=request.tvdb_id,
+                    resource=field,
+                )
+            except _CandidateRejected:
+                continue
+            if url in seen_urls:
+                continue
+            seen_urls.add(url)
+            width = _safe_int(item.get("width"))
+            height = _safe_int(item.get("height"))
+            if (width or height) and not _is_landscape(width, height):
+                continue
+            lang = item.get("lang")
+            candidates.append(
+                SourceCandidate(
+                    source="fanart",
+                    url=url,
+                    width=width,
+                    height=height,
+                    language=(
+                        lang
+                        if isinstance(lang, str) and lang and lang != "00"
+                        else None
+                    ),
+                    likes=_safe_int(item.get("likes")),
+                    ordinal=ordinal,
+                    tier=tier,
+                    image_type=IMAGE_TYPE_LOGO,
+                )
+            )
+            ordinal += 1
+    candidates.sort(
+        key=lambda item: (
+            item.tier,
+            -(item.width * item.height),
+            -item.likes,
+            item.ordinal,
+        )
+    )
+    return candidates[:MAX_ENUMERATED_PER_SOURCE]
+
+
 def _decode_screening_image(
     body: bytes,
     content_type: str,
     settings: DiscoverySettings,
+    *,
+    image_type: str = IMAGE_TYPE_PRIMARY,
 ) -> tuple[Image.Image, int, int]:
     media_type = content_type.split(";", 1)[0].strip().lower()
     expected_format = _IMAGE_CONTENT_TYPES.get(media_type)
@@ -728,7 +934,7 @@ def _decode_screening_image(
                     or width * height > settings.max_pixels
                 ):
                     raise _CandidateRejected()
-                if not _is_portrait(width, height):
+                if not _has_useful_aspect(width, height, image_type):
                     raise _CandidateRejected()
                 probe.verify()
             with Image.open(io.BytesIO(body)) as decoded:
@@ -772,7 +978,12 @@ async def _fetch_screening_image(
         raise _CandidateRejected() from exc
     if not body:
         raise _CandidateRejected()
-    image, width, height = _decode_screening_image(body, content_type, settings)
+    image, width, height = _decode_screening_image(
+        body,
+        content_type,
+        settings,
+        image_type=candidate.image_type,
+    )
     return body, image, width, height
 
 
@@ -882,18 +1093,24 @@ async def _screen_source(
         seen_digests.add(digest)
         source_digests.append(digest)
         work["ocr"] += 1
-        try:
-            has_text = await _ocr_has_text(
-                image,
-                digest,
-                titles,
-                settings,
-                work,
-            )
-        finally:
+        if candidate.image_type == IMAGE_TYPE_LOGO:
+            # Logos are text artwork by design, so the clean-poster OCR gate does
+            # not apply; the byte fetch above already validated format, bounds,
+            # and landscape aspect and produced the dedupe digest.
             image.close()
-        if has_text:
-            continue
+        else:
+            try:
+                has_text = await _ocr_has_text(
+                    image,
+                    digest,
+                    titles,
+                    settings,
+                    work,
+                )
+            finally:
+                image.close()
+            if has_text:
+                continue
         accepted.append(
             replace(
                 candidate,
@@ -905,6 +1122,7 @@ async def _screen_source(
     if candidates and candidates[0].source == "fanart":
         accepted.sort(
             key=lambda item: (
+                item.tier,
                 -(item.width * item.height),
                 -item.likes,
                 item.ordinal,
@@ -913,6 +1131,7 @@ async def _screen_source(
     else:
         accepted.sort(
             key=lambda item: (
+                item.tier,
                 -(item.width * item.height),
                 -item.rating,
                 -item.votes,
@@ -940,8 +1159,10 @@ def _alternate_sources(
 
 
 def _cache_key(request: CandidateRequest, settings: DiscoverySettings) -> str:
+    is_logo = request.is_logo
     policy = {
-        "schema_version": SCHEMA_VERSION,
+        "schema_version": request.schema_version,
+        "image_type": request.image_type,
         "type": request.media_type,
         "tmdb_id": request.tmdb_id,
         "imdb_id": request.imdb_id,
@@ -953,9 +1174,13 @@ def _cache_key(request: CandidateRequest, settings: DiscoverySettings) -> str:
                 request.media_type == "movie" or request.tvdb_id is not None
             ),
         },
-        "ocr": (
-            f"{DETECT_RES_SIG}:{OCR_POLICY_REVISION}:"
-            f"{OCR_TITLE_POLICY_REVISION}:{settings.ocr_box_threshold:.4f}"
+        "screening": (
+            LOGO_SCREENING_REVISION
+            if is_logo
+            else (
+                f"{DETECT_RES_SIG}:{OCR_POLICY_REVISION}:"
+                f"{OCR_TITLE_POLICY_REVISION}:{settings.ocr_box_threshold:.4f}"
+            )
         ),
         "ranking": RANKING_REVISION,
         "bounds": {
@@ -963,11 +1188,75 @@ def _cache_key(request: CandidateRequest, settings: DiscoverySettings) -> str:
             "width": settings.max_width,
             "height": settings.max_height,
             "pixels": settings.max_pixels,
-            "aspect": [MIN_PORTRAIT_ASPECT, MAX_PORTRAIT_ASPECT],
+            "aspect": (
+                [MIN_LANDSCAPE_ASPECT, MAX_LANDSCAPE_ASPECT]
+                if is_logo
+                else [MIN_PORTRAIT_ASPECT, MAX_PORTRAIT_ASPECT]
+            ),
         },
     }
     encoded = json.dumps(policy, sort_keys=True, separators=(",", ":")).encode()
     return hashlib.sha256(encoded).hexdigest()
+
+
+def _build_response(
+    request: CandidateRequest,
+    statuses: dict[str, str],
+    selected: list[SourceCandidate],
+) -> dict[str, Any]:
+    response: dict[str, Any] = {"schema_version": request.schema_version}
+    if request.schema_version >= SCHEMA_VERSION_TYPED:
+        response["image_type"] = request.image_type
+    response["sources"] = statuses
+    response["candidates"] = [item.response_value() for item in selected]
+    return response
+
+
+def _canonical_cached_url(
+    item: dict[str, Any],
+    request: CandidateRequest,
+) -> bool:
+    url = item["url"]
+    try:
+        if item["source"] == "tmdb":
+            return (
+                canonical_tmdb_url(
+                    url.removeprefix("https://image.tmdb.org/t/p/original")
+                )
+                == url
+            )
+        if item["source"] == "fanart":
+            if request.is_logo:
+                resources = (
+                    _FANART_MOVIE_LOGO_RESOURCES
+                    if request.media_type == "movie"
+                    else _FANART_TV_LOGO_RESOURCES
+                )
+            else:
+                resources = (
+                    (_FANART_MOVIE_POSTER_RESOURCE,)
+                    if request.media_type == "movie"
+                    else (_FANART_TV_POSTER_RESOURCE,)
+                )
+            for resource in resources:
+                try:
+                    if (
+                        canonical_fanart_url(
+                            url,
+                            media_type=request.media_type,
+                            tmdb_id=request.tmdb_id,
+                            tvdb_id=request.tvdb_id,
+                            resource=resource,
+                        )
+                        == url
+                    ):
+                        return True
+                except _CandidateRejected:
+                    continue
+            return False
+    except _CandidateRejected:
+        return False
+    return False
 
 
 def _validate_cached_response(
@@ -975,13 +1264,21 @@ def _validate_cached_response(
     request: CandidateRequest,
     settings: DiscoverySettings,
 ) -> dict[str, Any] | None:
-    if not isinstance(value, dict) or set(value) != {
-        "schema_version",
-        "sources",
-        "candidates",
-    }:
+    if not isinstance(value, dict):
         return None
-    if value["schema_version"] != SCHEMA_VERSION or not isinstance(value["sources"], dict):
+    if request.schema_version >= SCHEMA_VERSION_TYPED:
+        expected_keys = {"schema_version", "image_type", "sources", "candidates"}
+    else:
+        expected_keys = {"schema_version", "sources", "candidates"}
+    if set(value) != expected_keys:
+        return None
+    if value["schema_version"] != request.schema_version or not isinstance(
+        value["sources"], dict
+    ):
+        return None
+    if request.schema_version >= SCHEMA_VERSION_TYPED and (
+        value["image_type"] != request.image_type
+    ):
         return None
     if (
         set(value["sources"]) != {"tmdb", "fanart"}
@@ -1003,35 +1300,23 @@ def _validate_cached_response(
             "language",
         }:
             return None
-        try:
-            if item["source"] == "tmdb":
-                if canonical_tmdb_url(
-                    item["url"].removeprefix(
-                        "https://image.tmdb.org/t/p/original"
-                    )
-                ) != item["url"]:
-                    return None
-            elif item["source"] == "fanart":
-                if canonical_fanart_url(
-                    item["url"],
-                    media_type=request.media_type,
-                    tmdb_id=request.tmdb_id,
-                    tvdb_id=request.tvdb_id,
-                ) != item["url"]:
-                    return None
-            else:
-                return None
-        except _CandidateRejected:
+        if item["source"] not in ("tmdb", "fanart"):
+            return None
+        if not _canonical_cached_url(item, request):
             return None
         if (
             type(item["width"]) is not int
             or type(item["height"]) is not int
-            or not _is_portrait(item["width"], item["height"])
+            or not _has_useful_aspect(item["width"], item["height"], request.image_type)
             or item["width"] > settings.max_width
             or item["height"] > settings.max_height
             or item["width"] * item["height"] > settings.max_pixels
-            or item["language"] is not None
         ):
+            return None
+        if request.is_logo:
+            if item["language"] is not None and not isinstance(item["language"], str):
+                return None
+        elif item["language"] is not None:
             return None
     return value
 
@@ -1062,19 +1347,23 @@ async def _run_discovery_search(
                 )
                 if validated_cache is not None:
                     return validated_cache, "cache"
-                active_ocr = _ocr_worker.active_future
-                if active_ocr is not None and not active_ocr.done():
-                    raise CandidateDiscoveryError(
-                        503,
-                        "text_detection_unavailable",
-                        "Text detection is unavailable or uncertain",
-                    )
-                if not text_detection_ready():
-                    raise CandidateDiscoveryError(
-                        503,
-                        "text_detection_unavailable",
-                        "Text detection is unavailable or uncertain",
-                    )
+                # The OCR readiness gate only applies to Primary discovery. Logo
+                # candidates never run the clean-poster OCR text gate, so they
+                # must stay available even when text detection is unavailable.
+                if not request.is_logo:
+                    active_ocr = _ocr_worker.active_future
+                    if active_ocr is not None and not active_ocr.done():
+                        raise CandidateDiscoveryError(
+                            503,
+                            "text_detection_unavailable",
+                            "Text detection is unavailable or uncertain",
+                        )
+                    if not text_detection_ready():
+                        raise CandidateDiscoveryError(
+                            503,
+                            "text_detection_unavailable",
+                            "Text detection is unavailable or uncertain",
+                        )
 
                 identity = await _fetch_identity(client, request, settings)
                 statuses = {
@@ -1091,11 +1380,17 @@ async def _run_discovery_search(
                 }
                 tmdb_values: list[SourceCandidate] = []
                 fanart_values: list[SourceCandidate] = []
+                tmdb_loader = (
+                    _tmdb_logo_candidates if request.is_logo else _tmdb_candidates
+                )
+                fanart_loader = (
+                    _fanart_logo_candidates if request.is_logo else _fanart_candidates
+                )
 
                 async def _load_tmdb() -> None:
                     nonlocal tmdb_values
                     try:
-                        tmdb_values = await _tmdb_candidates(client, request, settings)
+                        tmdb_values = await tmdb_loader(client, request, settings)
                     except _SourceFailure:
                         statuses["tmdb"] = "failed"
 
@@ -1104,7 +1399,7 @@ async def _run_discovery_search(
                     if statuses["fanart"] != "ready":
                         return
                     try:
-                        fanart_values = await _fanart_candidates(
+                        fanart_values = await fanart_loader(
                             client,
                             request,
                             identity,
@@ -1163,11 +1458,7 @@ async def _run_discovery_search(
                     )
 
                 selected = _alternate_sources(clean_tmdb, clean_fanart)
-                response = {
-                    "schema_version": SCHEMA_VERSION,
-                    "sources": statuses,
-                    "candidates": [item.response_value() for item in selected],
-                }
+                response = _build_response(request, statuses, selected)
                 partial = "failed" in statuses.values()
                 result_class = (
                     "partial"

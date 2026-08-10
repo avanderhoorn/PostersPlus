@@ -1738,5 +1738,739 @@ class EndpointContractTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(record.args[2], "/v1/artwork/candidates?<redacted>")
 
 
+class TypedSchemaTests(unittest.TestCase):
+    def test_schema_two_requires_explicit_image_type(self):
+        primary = candidates.decode_request_body(json.dumps({
+            "schema_version": 2,
+            "type": "movie",
+            "tmdb_id": "123",
+            "image_type": "Primary",
+        }).encode())
+        self.assertEqual(primary.schema_version, 2)
+        self.assertEqual(primary.image_type, "Primary")
+        self.assertFalse(primary.is_logo)
+
+        logo = candidates.decode_request_body(json.dumps({
+            "schema_version": 2,
+            "type": "series",
+            "tmdb_id": "123",
+            "tvdb_id": "456",
+            "image_type": "Logo",
+        }).encode())
+        self.assertEqual(logo.schema_version, 2)
+        self.assertEqual(logo.image_type, "Logo")
+        self.assertTrue(logo.is_logo)
+        self.assertEqual(logo.tvdb_id, "456")
+
+    def test_schema_one_stays_primary_only_and_rejects_image_type(self):
+        parsed = candidates.decode_request_body(json.dumps({
+            "schema_version": 1,
+            "type": "movie",
+            "tmdb_id": "123",
+        }).encode())
+        self.assertEqual(parsed.schema_version, 1)
+        self.assertEqual(parsed.image_type, "Primary")
+
+        with self.assertRaises(candidates.CandidateDiscoveryError):
+            candidates.decode_request_body(json.dumps({
+                "schema_version": 1,
+                "type": "movie",
+                "tmdb_id": "123",
+                "image_type": "Primary",
+            }).encode())
+
+    def test_schema_two_rejects_missing_bad_or_case_variant_image_type(self):
+        invalid = (
+            b'{"schema_version":2,"type":"movie","tmdb_id":"123"}',
+            b'{"schema_version":2,"type":"movie","tmdb_id":"123","image_type":"logo"}',
+            b'{"schema_version":2,"type":"movie","tmdb_id":"123","image_type":"PRIMARY"}',
+            b'{"schema_version":2,"type":"movie","tmdb_id":"123","image_type":"Banner"}',
+            b'{"schema_version":2,"type":"movie","tmdb_id":"123","image_type":1}',
+            b'{"schema_version":2,"type":"movie","tmdb_id":"123","image_type":null}',
+            b'{"schema_version":2,"type":"movie","tmdb_id":"123","image_type":"Logo","limit":8}',
+            b'{"schema_version":3,"type":"movie","tmdb_id":"123","image_type":"Logo"}',
+        )
+        for body in invalid:
+            with self.subTest(body=body):
+                with self.assertRaises(candidates.CandidateDiscoveryError):
+                    candidates.decode_request_body(body)
+
+    def test_image_type_error_is_typed(self):
+        with self.assertRaises(candidates.CandidateDiscoveryError) as raised:
+            candidates.decode_request_body(json.dumps({
+                "schema_version": 2,
+                "type": "movie",
+                "tmdb_id": "123",
+                "image_type": "logo",
+            }).encode())
+        self.assertEqual(raised.exception.status_code, 400)
+        self.assertEqual(raised.exception.code, "invalid_image_type")
+
+
+class LogoUrlPolicyTests(unittest.TestCase):
+    def test_movie_and_tv_logo_resources_are_canonical(self):
+        movie = candidates.canonical_fanart_url(
+            "https://assets.fanart.tv/fanart/movies/123/hdmovielogo/x.png",
+            media_type="movie",
+            tmdb_id="123",
+            tvdb_id=None,
+            resource="hdmovielogo",
+        )
+        self.assertTrue(movie.endswith("/hdmovielogo/x.png"))
+        tv = candidates.canonical_fanart_url(
+            "https://assets.fanart.tv/fanart/tv/456/clearlogo/y.png",
+            media_type="series",
+            tmdb_id="123",
+            tvdb_id="456",
+            resource="clearlogo",
+        )
+        self.assertTrue(tv.endswith("/clearlogo/y.png"))
+
+    def test_logo_resource_mismatch_and_cross_media_are_rejected(self):
+        cases = (
+            # path segment does not match the requested resource
+            dict(
+                url="https://assets.fanart.tv/fanart/movies/123/hdmovielogo/x.png",
+                media_type="movie",
+                tmdb_id="123",
+                tvdb_id=None,
+                resource="movieposter",
+            ),
+            # tv logo resource requested for a movie
+            dict(
+                url="https://assets.fanart.tv/fanart/movies/123/hdtvlogo/x.png",
+                media_type="movie",
+                tmdb_id="123",
+                tvdb_id=None,
+                resource="hdtvlogo",
+            ),
+            # unknown resource segment
+            dict(
+                url="https://assets.fanart.tv/fanart/movies/123/evil/x.png",
+                media_type="movie",
+                tmdb_id="123",
+                tvdb_id=None,
+                resource="evil",
+            ),
+        )
+        for case in cases:
+            with self.subTest(resource=case["resource"]):
+                with self.assertRaises(candidates._CandidateRejected):
+                    candidates.canonical_fanart_url(
+                        case["url"],
+                        media_type=case["media_type"],
+                        tmdb_id=case["tmdb_id"],
+                        tvdb_id=case["tvdb_id"],
+                        resource=case["resource"],
+                    )
+
+    def test_landscape_aspect_gate(self):
+        self.assertTrue(candidates._is_landscape(800, 310))
+        self.assertFalse(candidates._is_landscape(600, 900))
+        self.assertFalse(candidates._is_landscape(500, 500))
+        self.assertFalse(candidates._is_landscape(4000, 100))
+
+
+def _logo_request(media_type="movie", tvdb_id=None, imdb_id="tt1234567"):
+    return candidates.CandidateRequest(
+        media_type=media_type,
+        tmdb_id="123",
+        imdb_id=imdb_id,
+        tvdb_id=tvdb_id,
+        schema_version=2,
+        image_type="Logo",
+    )
+
+
+class LogoAdapterTests(unittest.IsolatedAsyncioTestCase):
+    async def test_tmdb_logos_filter_landscape_skip_svg_rank_and_cap(self):
+        logos = [
+            {
+                "file_path": f"/logo-{index}.png",
+                "iso_639_1": "en",
+                "width": 400 + index,
+                "height": 155,
+                "vote_average": 5 + index / 10,
+                "vote_count": index,
+            }
+            for index in range(10)
+        ]
+        logos.extend([
+            {"file_path": "/vector.svg", "iso_639_1": None, "width": 800, "height": 310},
+            {"file_path": "/portrait.png", "iso_639_1": None, "width": 300, "height": 900},
+            {"file_path": "/neutral.png", "iso_639_1": None, "width": 900, "height": 320},
+        ])
+
+        async def handler(request):
+            self.assertEqual(request.url.params["api_key"], "tmdb-secret")
+            self.assertEqual(request.url.params["include_image_language"], "en,null")
+            return _json_response({"logos": logos})
+
+        async with httpx.AsyncClient(transport=httpx.MockTransport(handler)) as client:
+            values = await candidates._tmdb_logo_candidates(
+                client,
+                _logo_request(),
+                _settings(),
+            )
+        self.assertEqual(len(values), 8)
+        self.assertTrue(all(v.image_type == "Logo" for v in values))
+        self.assertTrue(all(v.source == "tmdb" for v in values))
+        # Largest by pixel area ranks first; the 900x320 neutral logo wins.
+        self.assertEqual(values[0].url.rsplit("/", 1)[-1], "neutral.png")
+        self.assertIsNone(values[0].language)
+        # No SVG or portrait leaked in.
+        joined = " ".join(v.url for v in values)
+        self.assertNotIn("vector.svg", joined)
+        self.assertNotIn("portrait.png", joined)
+        # Language-tagged logos preserve their language.
+        english = [v for v in values if v.url.endswith("logo-9.png")]
+        self.assertEqual(english[0].language, "en")
+
+    async def test_fanart_logos_prefer_hd_dedupe_and_normalize_lang(self):
+        payload = {
+            "hdmovielogo": [
+                {
+                    "url": "https://assets.fanart.tv/fanart/movies/123/hdmovielogo/a.png",
+                    "lang": "en",
+                    "likes": "5",
+                    "width": 400,
+                    "height": 155,
+                },
+                {
+                    # exact duplicate URL is de-duplicated
+                    "url": "https://assets.fanart.tv/fanart/movies/123/hdmovielogo/a.png",
+                    "lang": "en",
+                    "likes": "5",
+                    "width": 400,
+                    "height": 155,
+                },
+            ],
+            "movielogo": [
+                {
+                    # larger, but a lower-quality fallback resource
+                    "url": "https://assets.fanart.tv/fanart/movies/123/movielogo/b.png",
+                    "lang": "00",
+                    "likes": "99",
+                    "width": 800,
+                    "height": 310,
+                },
+            ],
+        }
+
+        async def handler(request):
+            self.assertEqual(request.url.path, "/v3/movies/123")
+            return _json_response(payload)
+
+        identity = candidates._Identity(("Title",), True)
+        async with httpx.AsyncClient(transport=httpx.MockTransport(handler)) as client:
+            values = await candidates._fanart_logo_candidates(
+                client,
+                _logo_request(),
+                identity,
+                _settings(),
+            )
+        self.assertEqual(len(values), 2)
+        # HD-specific resource ranks ahead of the larger fallback logo.
+        self.assertTrue(values[0].url.endswith("/hdmovielogo/a.png"))
+        self.assertEqual(values[0].tier, 0)
+        self.assertEqual(values[0].language, "en")
+        self.assertTrue(values[1].url.endswith("/movielogo/b.png"))
+        self.assertEqual(values[1].tier, 1)
+        # Fanart neutral marker "00" normalizes to null language.
+        self.assertIsNone(values[1].language)
+        self.assertTrue(all(v.image_type == "Logo" for v in values))
+
+    async def test_fanart_series_logos_use_tv_resources(self):
+        payload = {
+            "hdtvlogo": [
+                {
+                    "url": "https://assets.fanart.tv/fanart/tv/456/hdtvlogo/a.png",
+                    "lang": "en",
+                    "likes": "5",
+                    "width": 800,
+                    "height": 310,
+                },
+            ],
+            "clearlogo": [
+                {
+                    "url": "https://assets.fanart.tv/fanart/tv/456/clearlogo/b.png",
+                    "lang": "en",
+                    "likes": "5",
+                    "width": 800,
+                    "height": 310,
+                },
+            ],
+        }
+
+        async def handler(request):
+            self.assertEqual(request.url.path, "/v3/tv/456")
+            return _json_response(payload)
+
+        identity = candidates._Identity(("Title",), True)
+        async with httpx.AsyncClient(transport=httpx.MockTransport(handler)) as client:
+            values = await candidates._fanart_logo_candidates(
+                client,
+                _logo_request("series", "456"),
+                identity,
+                _settings(),
+            )
+        self.assertEqual(
+            [v.url.rsplit("/", 2)[-2] for v in values],
+            ["hdtvlogo", "clearlogo"],
+        )
+
+    async def test_series_fanart_logos_require_verified_tvdb(self):
+        handler = AsyncMock()
+        async with httpx.AsyncClient(transport=httpx.MockTransport(handler)) as client:
+            values = await candidates._fanart_logo_candidates(
+                client,
+                _logo_request("series"),
+                candidates._Identity(("Title",), False),
+                _settings(),
+            )
+        self.assertEqual(values, [])
+        handler.assert_not_awaited()
+
+
+class LogoScreeningTests(unittest.IsolatedAsyncioTestCase):
+    async def test_screen_source_skips_ocr_for_logos(self):
+        logos = [
+            candidates.SourceCandidate(
+                "tmdb",
+                f"https://image.tmdb.org/t/p/original/logo-{index}.png",
+                800,
+                310,
+                "en",
+                image_type="Logo",
+            )
+            for index in range(2)
+        ]
+
+        async def fetch(_client, item, _settings):
+            return (
+                item.url.encode(),
+                Image.new("RGBA", (800, 310), "black"),
+                800,
+                310,
+            )
+
+        ocr = AsyncMock(return_value=True)
+        with (
+            patch.object(candidates, "_fetch_screening_image", side_effect=fetch),
+            patch.object(candidates, "_ocr_has_text", ocr),
+        ):
+            accepted, reliable = await candidates._screen_source(
+                Mock(),
+                logos,
+                titles=("Title",),
+                settings=_settings(),
+                seen_digests=set(),
+                work={"ocr": 0},
+            )
+        self.assertEqual(len(accepted), 2)
+        self.assertTrue(reliable)
+        self.assertTrue(all(c.sha256 for c in accepted))
+        ocr.assert_not_awaited()
+
+    def test_logo_decoder_enforces_landscape_window(self):
+        settings = _settings()
+        image, width, height = candidates._decode_screening_image(
+            _image_bytes(size=(800, 310), image_format="PNG"),
+            "image/png",
+            settings,
+            image_type="Logo",
+        )
+        image.close()
+        self.assertEqual((width, height), (800, 310))
+        with self.assertRaises(candidates._CandidateRejected):
+            candidates._decode_screening_image(
+                _image_bytes(size=(600, 900)),
+                "image/jpeg",
+                settings,
+                image_type="Logo",
+            )
+
+
+class TypedDiscoveryPipelineTests(unittest.IsolatedAsyncioTestCase):
+    def setUp(self):
+        candidates._search_admission.reset_for_tests()
+        candidates._candidate_inflight.clear()
+        candidates._ocr_worker.reset_for_tests()
+
+    async def _discover_logo(self, *, tmdb_values, fanart_values, text_ready=False):
+        ocr = AsyncMock(return_value=False)
+        with (
+            patch.object(
+                candidates,
+                "_fetch_identity",
+                AsyncMock(return_value=candidates._Identity(("Title",), True)),
+            ),
+            patch.object(
+                candidates,
+                "_tmdb_logo_candidates",
+                AsyncMock(return_value=tmdb_values),
+            ),
+            patch.object(
+                candidates,
+                "_fanart_logo_candidates",
+                AsyncMock(return_value=fanart_values),
+            ),
+            patch.object(candidates, "get_cached_artwork_candidates", return_value=None),
+            patch.object(candidates, "set_cached_artwork_candidates") as cache_write,
+            patch.object(candidates, "text_detection_ready", return_value=text_ready),
+            patch.object(
+                candidates,
+                "_fetch_screening_image",
+                AsyncMock(side_effect=lambda _client, item, _settings: (
+                    item.url.encode(),
+                    Image.new("RGBA", (item.width, item.height), "black"),
+                    item.width,
+                    item.height,
+                )),
+            ),
+            patch.object(candidates, "_ocr_has_text", ocr),
+        ):
+            result = await candidates.discover_candidates(
+                Mock(),
+                _logo_request("series", "456"),
+                settings=_settings(),
+            )
+        return result, cache_write, ocr
+
+    async def test_logo_discovery_returns_typed_v2_response_without_ocr(self):
+        tmdb_values = [
+            candidates.SourceCandidate(
+                "tmdb",
+                f"https://image.tmdb.org/t/p/original/tmdb-{index}.png",
+                800,
+                310,
+                "en",
+                rating=10 - index,
+                votes=100 - index,
+                ordinal=index,
+                image_type="Logo",
+            )
+            for index in range(2)
+        ]
+        fanart_values = [
+            candidates.SourceCandidate(
+                "fanart",
+                f"https://assets.fanart.tv/fanart/tv/456/hdtvlogo/fanart-{index}.png",
+                800,
+                310,
+                None,
+                likes=50 - index,
+                ordinal=index,
+                image_type="Logo",
+            )
+            for index in range(2)
+        ]
+        # text detection deliberately unavailable to prove Logo never gates on OCR
+        (response, outcome), cache_write, ocr = await self._discover_logo(
+            tmdb_values=tmdb_values,
+            fanart_values=fanart_values,
+            text_ready=False,
+        )
+        self.assertEqual(outcome, "complete")
+        self.assertEqual(response["schema_version"], 2)
+        self.assertEqual(response["image_type"], "Logo")
+        self.assertEqual(
+            set(response),
+            {"schema_version", "image_type", "sources", "candidates"},
+        )
+        self.assertEqual(set(response["sources"]), {"tmdb", "fanart"})
+        self.assertEqual(len(response["candidates"]), 4)
+        self.assertEqual(
+            [c["source"] for c in response["candidates"]],
+            ["tmdb", "fanart"] * 2,
+        )
+        self.assertTrue(all(
+            set(c) == {"source", "url", "width", "height", "language"}
+            for c in response["candidates"]
+        ))
+        # Logos are landscape and may carry language text.
+        self.assertTrue(all(c["width"] > c["height"] for c in response["candidates"]))
+        ocr.assert_not_awaited()
+        cache_write.assert_called_once()
+        self.assertEqual(cache_write.call_args.args[2], "complete")
+
+    async def test_v2_primary_preserves_portrait_behaviour(self):
+        item = candidates.SourceCandidate(
+            "tmdb",
+            "https://image.tmdb.org/t/p/original/clean.jpg",
+            600,
+            900,
+            None,
+        )
+        with (
+            patch.object(
+                candidates,
+                "_fetch_identity",
+                AsyncMock(return_value=candidates._Identity(("Title",), False)),
+            ),
+            patch.object(candidates, "_tmdb_candidates", AsyncMock(return_value=[item])),
+            patch.object(candidates, "_fanart_candidates", AsyncMock(return_value=[])),
+            patch.object(candidates, "get_cached_artwork_candidates", return_value=None),
+            patch.object(candidates, "set_cached_artwork_candidates"),
+            patch.object(candidates, "text_detection_ready", return_value=True),
+            patch.object(
+                candidates,
+                "_fetch_screening_image",
+                AsyncMock(return_value=(
+                    b"clean",
+                    Image.new("RGBA", (600, 900), "black"),
+                    600,
+                    900,
+                )),
+            ),
+            patch.object(candidates, "_ocr_has_text", AsyncMock(return_value=False)) as ocr,
+        ):
+            request = candidates.CandidateRequest(
+                media_type="movie",
+                tmdb_id="123",
+                imdb_id=None,
+                tvdb_id=None,
+                schema_version=2,
+                image_type="Primary",
+            )
+            response, outcome = await candidates.discover_candidates(
+                Mock(),
+                request,
+                settings=_settings(),
+            )
+        self.assertEqual(outcome, "complete")
+        self.assertEqual(response["schema_version"], 2)
+        self.assertEqual(response["image_type"], "Primary")
+        self.assertEqual(len(response["candidates"]), 1)
+        self.assertEqual(response["candidates"][0]["language"], None)
+        ocr.assert_awaited()
+
+    async def test_v2_primary_still_requires_text_detection(self):
+        with (
+            patch.object(candidates, "get_cached_artwork_candidates", return_value=None),
+            patch.object(candidates, "text_detection_ready", return_value=False),
+            patch.object(candidates, "_fetch_identity", AsyncMock()) as identity,
+        ):
+            request = candidates.CandidateRequest(
+                media_type="movie",
+                tmdb_id="123",
+                imdb_id=None,
+                tvdb_id=None,
+                schema_version=2,
+                image_type="Primary",
+            )
+            with self.assertRaises(candidates.CandidateDiscoveryError) as raised:
+                await candidates.discover_candidates(
+                    Mock(),
+                    request,
+                    settings=_settings(),
+                )
+        self.assertEqual(raised.exception.code, "text_detection_unavailable")
+        identity.assert_not_awaited()
+
+    def test_logo_cache_contract_validates_landscape_and_language(self):
+        request = _logo_request("series", "456")
+        valid = {
+            "schema_version": 2,
+            "image_type": "Logo",
+            "sources": {"tmdb": "ready", "fanart": "ready"},
+            "candidates": [
+                {
+                    "source": "tmdb",
+                    "url": "https://image.tmdb.org/t/p/original/logo.png",
+                    "width": 800,
+                    "height": 310,
+                    "language": "en",
+                },
+                {
+                    "source": "fanart",
+                    "url": "https://assets.fanart.tv/fanart/tv/456/clearlogo/b.png",
+                    "width": 800,
+                    "height": 310,
+                    "language": None,
+                },
+            ],
+        }
+        self.assertEqual(
+            candidates._validate_cached_response(
+                json.loads(json.dumps(valid)),
+                request,
+                _settings(),
+            ),
+            valid,
+        )
+        # A portrait logo candidate is rejected.
+        portrait = json.loads(json.dumps(valid))
+        portrait["candidates"][0]["width"] = 300
+        portrait["candidates"][0]["height"] = 900
+        self.assertIsNone(
+            candidates._validate_cached_response(portrait, request, _settings())
+        )
+        # A v1-shaped cache (no image_type) does not satisfy a v2 request.
+        wrong_shape = json.loads(json.dumps(valid))
+        wrong_shape.pop("image_type")
+        wrong_shape["schema_version"] = 1
+        self.assertIsNone(
+            candidates._validate_cached_response(wrong_shape, request, _settings())
+        )
+        # A Primary request must not accept a landscape (logo) cache.
+        primary_request = _request("series", "456")
+        self.assertIsNone(
+            candidates._validate_cached_response(
+                json.loads(json.dumps(valid)),
+                primary_request,
+                _settings(),
+            )
+        )
+
+
+class TypedEndpointTests(unittest.IsolatedAsyncioTestCase):
+    async def _post(self, body, headers=None, params=""):
+        transport = httpx.ASGITransport(app=main.app)
+        async with httpx.AsyncClient(
+            transport=transport,
+            base_url="http://test",
+        ) as client:
+            return await client.post(
+                f"/v1/artwork/candidates{params}",
+                json=body,
+                headers=headers,
+            )
+
+    async def test_endpoint_dispatches_typed_logo_request(self):
+        success = {
+            "schema_version": 2,
+            "image_type": "Logo",
+            "sources": {"tmdb": "ready", "fanart": "ready"},
+            "candidates": [],
+        }
+        discover = AsyncMock(return_value=(success, "empty"))
+        with (
+            patch.object(main._cfg, "JELLYFIN_ARTWORK_DISCOVERY_KEY", "discover"),
+            patch.object(main._cfg, "ACCESS_KEY", "render"),
+            patch.object(main, "_HTTP_CLIENT", Mock()),
+            patch.object(main, "discover_candidates", discover),
+        ):
+            response = await self._post(
+                {
+                    "schema_version": 2,
+                    "type": "series",
+                    "tmdb_id": "123",
+                    "tvdb_id": "456",
+                    "image_type": "Logo",
+                },
+                headers={"X-Jellyfin-Artwork-Discovery-Key": "discover"},
+            )
+        self.assertEqual(response.status_code, 200)
+        self.assertEqual(response.json()["image_type"], "Logo")
+        dispatched = discover.await_args_list[0].args[1]
+        self.assertEqual(dispatched.image_type, "Logo")
+        self.assertEqual(dispatched.schema_version, 2)
+
+    async def test_endpoint_rejects_bad_image_type(self):
+        discover = AsyncMock()
+        with (
+            patch.object(main._cfg, "JELLYFIN_ARTWORK_DISCOVERY_KEY", "discover"),
+            patch.object(main, "_HTTP_CLIENT", Mock()),
+            patch.object(main, "discover_candidates", discover),
+        ):
+            response = await self._post(
+                {
+                    "schema_version": 2,
+                    "type": "movie",
+                    "tmdb_id": "123",
+                    "image_type": "logo",
+                },
+                headers={"X-Jellyfin-Artwork-Discovery-Key": "discover"},
+            )
+        self.assertEqual(response.status_code, 400)
+        self.assertEqual(response.json()["error"]["code"], "invalid_image_type")
+        discover.assert_not_awaited()
+
+
+class TypedResponseContractTests(unittest.TestCase):
+    def _selected(self, image_type):
+        return [
+            candidates.SourceCandidate(
+                "tmdb",
+                "https://image.tmdb.org/t/p/original/x.jpg",
+                800 if image_type == "Logo" else 600,
+                310 if image_type == "Logo" else 900,
+                "en" if image_type == "Logo" else None,
+                image_type=image_type,
+            )
+        ]
+
+    def test_v2_response_is_self_describing_with_exact_top_level_fields(self):
+        for image_type in ("Primary", "Logo"):
+            with self.subTest(image_type=image_type):
+                request = candidates.CandidateRequest(
+                    media_type="series",
+                    tmdb_id="123",
+                    imdb_id=None,
+                    tvdb_id="456",
+                    schema_version=2,
+                    image_type=image_type,
+                )
+                response = candidates._build_response(
+                    request,
+                    {"tmdb": "ready", "fanart": "ready"},
+                    self._selected(image_type),
+                )
+                self.assertEqual(
+                    list(response),
+                    ["schema_version", "image_type", "sources", "candidates"],
+                )
+                self.assertEqual(response["schema_version"], 2)
+                # image_type in the response always equals the v2 request.
+                self.assertEqual(response["image_type"], image_type)
+
+    def test_v1_response_shape_is_unchanged(self):
+        request = candidates.CandidateRequest(
+            media_type="movie",
+            tmdb_id="123",
+            imdb_id=None,
+            tvdb_id=None,
+        )
+        response = candidates._build_response(
+            request,
+            {"tmdb": "ready", "fanart": "failed"},
+            self._selected("Primary"),
+        )
+        self.assertEqual(
+            list(response),
+            ["schema_version", "sources", "candidates"],
+        )
+        self.assertEqual(response["schema_version"], 1)
+        self.assertNotIn("image_type", response)
+
+    def test_cache_validation_requires_image_type_to_match_v2_request(self):
+        logo_request = _logo_request("series", "456")
+        mismatched = {
+            "schema_version": 2,
+            "image_type": "Primary",
+            "sources": {"tmdb": "ready", "fanart": "ready"},
+            "candidates": [],
+        }
+        # A cached Primary-typed body must not satisfy a Logo request.
+        self.assertIsNone(
+            candidates._validate_cached_response(
+                mismatched,
+                logo_request,
+                _settings(),
+            )
+        )
+        matched = json.loads(json.dumps(mismatched))
+        matched["image_type"] = "Logo"
+        self.assertEqual(
+            candidates._validate_cached_response(
+                matched,
+                logo_request,
+                _settings(),
+            ),
+            matched,
+        )
+
+
 if __name__ == "__main__":
     unittest.main()
