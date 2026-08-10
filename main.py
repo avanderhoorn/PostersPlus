@@ -3454,8 +3454,9 @@ async def artwork_candidates(request: Request):
         candidate_request,
     )
     logger.info(
-        "Artwork discovery complete: type=%s tmdb=%s fanart=%s count=%d outcome=%s",
+        "Artwork discovery complete: type=%s image_type=%s tmdb=%s fanart=%s count=%d outcome=%s",
         candidate_request.media_type,
+        candidate_request.image_type,
         response["sources"].get("tmdb", "unknown"),
         response["sources"].get("fanart", "unknown"),
         len(response["candidates"]),

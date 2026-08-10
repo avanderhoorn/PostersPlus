@@ -362,7 +362,7 @@ What changes on this path:
 
 If you only want MyAnimeList *scores* on anime that already has an IMDb id, you don't need any of this — MDBList already returns a `myanimelist` rating, so just give that source a non-zero weight.
 
-### Clean Primary candidate discovery
+### Clean Primary and typed Logo candidate discovery
 
 `POST /v1/artwork/candidates` is the renderer's bounded, discovery-only
 operation for Jellyfin's **Homestack Clean Artwork** provider. It requires
@@ -384,16 +384,46 @@ curl --fail-with-body \
   http://postersplus:8000/v1/artwork/candidates
 ```
 
-The exact schema requires `schema_version: 1`, `type` (`movie` or `series`),
-and a string `tmdb_id`. `imdb_id` and `tvdb_id` may each be omitted or set to
-`null`; when non-null they must be valid strings and are cross-checked against
-TMDb. A non-null `tvdb_id` is accepted only for `series`; Movies reject it
-because TMDb movie external IDs do not provide a verified TVDB mapping.
-PostersPlus queries TMDb and optionally Fanart.tv, screens bounded
+The exact schema requires `schema_version` (`1` or `2`), `type` (`movie` or
+`series`), and a string `tmdb_id`. `imdb_id` and `tvdb_id` may each be omitted
+or set to `null`; when non-null they must be valid strings and are cross-checked
+against TMDb. A non-null `tvdb_id` is accepted only for `series`; Movies reject
+it because TMDb movie external IDs do not provide a verified TVDB mapping.
+
+`schema_version: 1` is **Primary-only** and rejects an `image_type` field.
+`schema_version: 2` adds a required, case-sensitive `image_type` of exactly
+`"Primary"` or `"Logo"`, letting a caller ask for either artwork kind so a
+Jellyfin remote image provider can surface both through Edit Images. Any other
+value (including `"logo"` or `"PRIMARY"`) is rejected with `invalid_image_type`.
+Unknown fields, duplicate keys, and unsupported schema versions are still
+rejected strictly. A `schema_version: 2` response echoes its `schema_version`
+and the requested `image_type`; `schema_version: 1` responses are unchanged.
+
+```bash
+curl --fail-with-body \
+  -H "X-Jellyfin-Artwork-Discovery-Key: $JELLYFIN_ARTWORK_DISCOVERY_KEY" \
+  -H "Content-Type: application/json" \
+  --data '{"schema_version":2,"type":"series","tmdb_id":"123","tvdb_id":"456","image_type":"Logo"}' \
+  http://postersplus:8000/v1/artwork/candidates
+```
+
+**Primary** discovery queries TMDb and optionally Fanart.tv, screens bounded
 portrait bytes with one OCR worker, deduplicates exact bytes, alternates
 source-ranked results, and returns at most eight credential-free HTTPS URLs
 from `image.tmdb.org` or `assets.fanart.tv`. Series Fanart results require a
 supplied, verified TVDB ID.
+
+**Logo** discovery aggregates TMDb `logos` and Fanart logo fields
+(`hdmovielogo`/`movielogo` for movies, `hdtvlogo`/`clearlogo` for series),
+preferring the HD/logo-specific resource before the lower-quality fallback.
+Because logos are text artwork by design, Logo discovery does **not** run the
+clean-poster OCR text gate and stays available even when text detection is
+unavailable. It still enforces the same trusted-source canonical URLs,
+supported image formats, useful landscape dimensions, deterministic
+ranking/deduplication, bounded candidate counts, timeouts/concurrency, and
+`tmdb`/`fanart` source status reporting; returned Logo candidates may carry a
+non-null `language`.
+
 The response always contains exactly `tmdb` and `fanart` source keys, each
 reported as only `ready` or `failed`; missing Fanart credentials or an
 unverified Series TVDB identity report Fanart as `failed`.

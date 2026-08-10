@@ -2,6 +2,24 @@
 
 ## Unreleased
 
+### Artwork discovery
+
+- `POST /v1/artwork/candidates` now supports a strict `schema_version: 2`
+  request with a required, case-sensitive `image_type` of `"Primary"` or
+  `"Logo"`, letting a Jellyfin remote image provider expose both artwork kinds
+  through Edit Images. `schema_version: 1` stays Primary-only and continues to
+  reject an `image_type` field; strict unknown-field, duplicate-key, and
+  unsupported-schema rejection is unchanged. Schema 2 responses echo their
+  `schema_version` and `image_type`.
+- Logo discovery aggregates TMDb `logos` and Fanart logo fields
+  (`hdmovielogo`/`movielogo` for movies, `hdtvlogo`/`clearlogo` for series),
+  preferring the HD/logo-specific resource before the fallback. Logos skip the
+  clean-poster OCR text gate (they are text artwork by design) and remain
+  available when text detection is unavailable, while still enforcing trusted
+  canonical source URLs, supported formats, landscape dimensions, deterministic
+  ranking/deduplication, bounded counts, timeouts/concurrency, and source
+  status reporting.
+
 ### Quality
 
 - Added QualiCache as a quality source: set `QUALITY_SOURCE=qualicache` and
