@@ -144,7 +144,7 @@ class UrlPolicyTests(unittest.TestCase):
     def test_tmdb_urls_are_constructed_canonically(self):
         self.assertEqual(
             candidates.canonical_tmdb_url("/abc_123.jpg"),
-            "https://image.tmdb.org/t/p/original/abc_123.jpg",
+            "https://image.tmdb.org/t/p/w500/abc_123.jpg",
         )
         for value in (
             "abc.jpg",
@@ -246,6 +246,7 @@ class AdapterTests(unittest.IsolatedAsyncioTestCase):
             )
         self.assertEqual(len(values), 8)
         self.assertEqual(values[0].url.rsplit("/", 1)[-1], "poster-9.jpg")
+        self.assertTrue(all("/t/p/w500/" in value.url for value in values))
         self.assertTrue(all(value.language is None for value in values))
 
     async def test_source_api_redirects_are_failures(self):
@@ -1198,7 +1199,7 @@ class DiscoveryPipelineTests(unittest.IsolatedAsyncioTestCase):
             "sources": {"tmdb": "ready", "fanart": "failed"},
             "candidates": [{
                 "source": "tmdb",
-                "url": "https://image.tmdb.org/t/p/original/clean.jpg",
+                "url": "https://image.tmdb.org/t/p/w500/clean.jpg",
                 "width": 600,
                 "height": 900,
                 "language": None,
@@ -1223,7 +1224,7 @@ class DiscoveryPipelineTests(unittest.IsolatedAsyncioTestCase):
             "sources": {"tmdb": "ready", "fanart": "failed"},
             "candidates": [{
                 "source": "tmdb",
-                "url": "https://image.tmdb.org/t/p/original/clean.jpg",
+                "url": "https://image.tmdb.org/t/p/w500/clean.jpg",
                 "width": 600,
                 "height": 900,
                 "language": None,
@@ -1915,6 +1916,7 @@ class LogoAdapterTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(len(values), 8)
         self.assertTrue(all(v.image_type == "Logo" for v in values))
         self.assertTrue(all(v.source == "tmdb" for v in values))
+        self.assertTrue(all("/t/p/w500/" in v.url for v in values))
         # Largest by pixel area ranks first; the 900x320 neutral logo wins.
         self.assertEqual(values[0].url.rsplit("/", 1)[-1], "neutral.png")
         self.assertIsNone(values[0].language)
@@ -2277,7 +2279,7 @@ class TypedDiscoveryPipelineTests(unittest.IsolatedAsyncioTestCase):
             "candidates": [
                 {
                     "source": "tmdb",
-                    "url": "https://image.tmdb.org/t/p/original/logo.png",
+                    "url": "https://image.tmdb.org/t/p/w500/logo.png",
                     "width": 800,
                     "height": 310,
                     "language": "en",

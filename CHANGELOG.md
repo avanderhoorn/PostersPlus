@@ -19,6 +19,10 @@
   canonical source URLs, supported formats, landscape dimensions, deterministic
   ranking/deduplication, bounded counts, timeouts/concurrency, and source
   status reporting.
+- TMDb discovery returns and screens the bounded `w500` asset that matches the
+  renderer's 500-pixel output width instead of downloading full-resolution
+  originals for every OCR candidate. This keeps cold Primary searches within
+  their memory and deadline budgets without reducing rendered poster quality.
 
 ### Quality
 
