@@ -41,6 +41,7 @@ MAX_BODY_BYTES = 4096
 MAX_ENUMERATED_PER_SOURCE = 8
 MAX_OCR_ATTEMPTS = 16
 MAX_RESULTS = 8
+TMDB_CANDIDATE_SIZE = "w500"
 SEARCH_DEADLINE_SECONDS = 20.0
 MAX_INFLIGHT_SEARCHES = 2
 MAX_SEARCH_STARTS_PER_MINUTE = 30
@@ -470,9 +471,12 @@ def _validate_base_url(url: str, expected_host: str) -> str:
 def canonical_tmdb_url(file_path: str) -> str:
     if not isinstance(file_path, str) or not _TMDB_FILE_RE.fullmatch(file_path):
         raise _CandidateRejected()
-    url = f"https://image.tmdb.org/t/p/original{file_path}"
+    url = f"https://image.tmdb.org/t/p/{TMDB_CANDIDATE_SIZE}{file_path}"
     path = _validate_base_url(url, "image.tmdb.org")
-    if not path.startswith("/t/p/original/") or path.count("/") != 4:
+    if (
+        not path.startswith(f"/t/p/{TMDB_CANDIDATE_SIZE}/")
+        or path.count("/") != 4
+    ):
         raise _CandidateRejected()
     return url
 
@@ -1221,7 +1225,9 @@ def _canonical_cached_url(
         if item["source"] == "tmdb":
             return (
                 canonical_tmdb_url(
-                    url.removeprefix("https://image.tmdb.org/t/p/original")
+                    url.removeprefix(
+                        f"https://image.tmdb.org/t/p/{TMDB_CANDIDATE_SIZE}"
+                    )
                 )
                 == url
             )
