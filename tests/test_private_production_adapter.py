@@ -137,6 +137,7 @@ class ProfileSchemaTests(unittest.TestCase):
         self.assertEqual(config.minimalist_rating_separator, "bullet")
         self.assertEqual(config.movie_weights["imdb"], 0.50)
         self.assertEqual(config.tv_weights["trakt"], 0.80)
+        self.assertEqual(config.badge_min_score, 1)
         self.assertEqual(config.shape, "portrait")
 
 

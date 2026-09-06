@@ -36,4 +36,4 @@ public_query:
   badge_anchor_x: 0.020
   badge_anchor_y: 0.015
   badge_gap: 4
-  badge_min_score: 5
+  badge_min_score: 1
