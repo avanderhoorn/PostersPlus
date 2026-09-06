@@ -3514,8 +3514,8 @@ def build_request_config(params: dict) -> RequestConfig:
     cfg.badge_anchor_x           = _f("badge_anchor_x",           cfg.badge_anchor_x,           0.0, 1.0)
     cfg.badge_anchor_y           = _f("badge_anchor_y",           cfg.badge_anchor_y,           0.0, 1.0)
     cfg.badge_min_score      = _i("badge_min_score",
-                                  _i("combined_badge_min_score", cfg.badge_min_score, 2, 6),
-                                  2, 6)
+                                  _i("combined_badge_min_score", cfg.badge_min_score, 1, 6),
+                                  1, 6)
     cfg.combined_badge_stacked   = _b("combined_badge_stacked",   cfg.combined_badge_stacked)
     for _gname in graphic_badges.GROUP_PARAMS:
         if _gname in params:
