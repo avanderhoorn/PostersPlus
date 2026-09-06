@@ -1,0 +1,39 @@
+schema_version: 2
+name: homestack-default
+public_query:
+  primary_client: stremio_tv_nuvio
+  top_gradient: low
+  bottom_gradient: low
+  vignette_poster_color_top: true
+  vignette_poster_color_bottom: true
+  vignette_color_saturation: 2.20
+  vignette_color_blur: 0.60
+  vignette_color_lightness: 1.10
+  fallback_to_imdb: true
+  rating_display_mode: 3
+  minimalist_append_mode: 1
+  minimalist_mode_font_size_ratio: 0.056
+  minimalist_mode_font_x_offset: 0.065
+  minimalist_mode_font_y_offset: 0.930
+  minimalist_score_out_of_10: true
+  minimalist_rating_separator: bullet
+  movie_weights:
+    trakt: 0.01
+    tomatoes: 0.25
+    popcorn: 0.25
+    imdb: 0.50
+  tv_weights:
+    trakt: 0.80
+    tomatoes: 0.20
+  original_art_source: top_rated
+  fallback_bg_style: photoreal
+  logo_max_w_ratio: 0.74
+  logo_max_h_ratio: 0.15
+  logo_bottom_ratio: 0.10
+  sash_mode: hidden
+  badge_display_mode: 2
+  badge_height: 29
+  badge_anchor_x: 0.020
+  badge_anchor_y: 0.015
+  badge_gap: 4
+  badge_min_score: 5

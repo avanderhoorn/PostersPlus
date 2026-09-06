@@ -57,6 +57,41 @@ TMDB_LOGO_CACHE_DIR   = "/app/cache/tmdb_logos" # base logos from TMDB
 # Environment
 
 ACCESS_KEY            = os.environ.get("ACCESS_KEY")
+JELLYFIN_ARTWORK_DISCOVERY_KEY = os.environ.get(
+    "JELLYFIN_ARTWORK_DISCOVERY_KEY", ""
+).strip()
+JELLYFIN_ARTWORK_FANART_PROJECT_API_KEY = os.environ.get(
+    "JELLYFIN_ARTWORK_FANART_PROJECT_API_KEY", ""
+).strip()
+JELLYFIN_ARTWORK_FANART_CLIENT_KEY = os.environ.get(
+    "JELLYFIN_ARTWORK_FANART_CLIENT_KEY", ""
+).strip()
+RENDER_PROFILE_PATH   = os.environ.get("RENDER_PROFILE_PATH", "").strip()
+UPSTREAM_REVISION     = "9d84d388a426c90ad439a27e01941538856fb85e"
+RENDERER_REVISION     = os.environ.get(
+    "POSTERSPLUS_RENDERER_REVISION", ""
+).strip().lower()
+SELECTED_MAX_BYTES    = max(
+    1, int(os.environ.get("SELECTED_MAX_BYTES", str(10 * 1024 * 1024)))
+)
+SELECTION_MAX_BYTES   = max(
+    1,
+    int(
+        os.environ.get(
+            "SELECTION_MAX_BYTES",
+            str(2 * (4 * ((SELECTED_MAX_BYTES + 2) // 3)) + 4096),
+        )
+    ),
+)
+SELECTED_MAX_WIDTH    = max(
+    1, int(os.environ.get("SELECTED_MAX_WIDTH", "8000"))
+)
+SELECTED_MAX_HEIGHT   = max(
+    1, int(os.environ.get("SELECTED_MAX_HEIGHT", "8000"))
+)
+SELECTED_MAX_PIXELS   = max(
+    1, int(os.environ.get("SELECTED_MAX_PIXELS", "20000000"))
+)
 AIOSTREAMS_URL        = os.environ.get("AIOSTREAMS_URL", "")
 AIOSTREAMS_AUTH       = os.environ.get("AIOSTREAMS_AUTH", "")
 

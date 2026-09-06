@@ -152,6 +152,11 @@ def text_detection_available() -> bool:
     return _HAS_RAPIDOCR
 
 
+def text_detection_ready() -> bool:
+    """True only after the configured detector session pool has loaded."""
+    return _ocr_pool is not None
+
+
 def text_detection_status() -> str:
     """Compact runtime status suitable for startup and request logs."""
     if not _HAS_RAPIDOCR:

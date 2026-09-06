@@ -155,6 +155,11 @@ All configuration is done via environment variables. Copy `.env.example` to `.en
 | `TVDB_NEG_CACHE_DURATION` | `3` | Days to cache a "no TVDB match / no art" result, so newly-added TVDB art is picked up sooner than a positive match |
 | `TVDB_TYPES_CACHE_DURATION` | `30` | Days to cache the TVDB artwork-type catalogue, which rarely changes |
 | `ACCESS_KEY` | - | Shared secret for request authentication. Leave blank to allow open access |
+| `JELLYFIN_ARTWORK_DISCOVERY_KEY` | derived | Optional discovery-only key. When unset, it is HMAC-SHA256-derived from `ACCESS_KEY` with the fixed `jellyfin-artwork-discovery-v1` context |
+| `JELLYFIN_ARTWORK_FANART_PROJECT_API_KEY` | - | Fanart.tv project key used only by bounded candidate discovery |
+| `JELLYFIN_ARTWORK_FANART_CLIENT_KEY` | - | Fanart.tv client key used only by bounded candidate discovery |
+| `RENDER_PROFILE_PATH` | - | Read-only schema-2 YAML profile for `POST /render/selection` |
+| `POSTERSPLUS_RENDERER_REVISION` | - | Full 40-character fork commit, supplied by the image build and exposed separately from the pinned upstream revision |
 | `WORKERS` | `1` | Uvicorn worker processes. One worker avoids duplicate uncached renders, scans, and API work across processes |
 | `AIOSTREAMS_URL` | - | Base URL of your AIOStreams instance (used when `QUALITY_SOURCE=aiostreams`) |
 | `AIOSTREAMS_AUTH` | - | AIOStreams credentials as Base64 `user:password` |
@@ -395,11 +400,42 @@ What changes on this path:
 
 If you only want MyAnimeList *scores* on anime that already has an IMDb id, you don't need any of this — MDBList already returns a `myanimelist` rating, so just give that source a non-zero weight.
 
+### Private Jellyfin artwork adapter
+
+`POST /v1/artwork/candidates` accepts strict schema 1 (Primary) and schema 2
+(typed `Primary` or `Logo`) requests authenticated with
+`X-Jellyfin-Artwork-Discovery-Key`. It validates exact TMDb/IMDb/TVDB
+identities, maps Movies and Series to their provider endpoints, screens bounded
+assets, alternates TMDb and Fanart.tv results, and returns at most eight
+canonical credential-free HTTPS URLs. Discovery has bounded concurrency,
+rate admission, a 20-second deadline, and separate complete/partial cache TTLs.
+
+`POST /render/selection` accepts the exact schema-1 Primary and optional Logo
+bytes selected in Jellyfin. It requires `X-Jellyfin-Artwork-Key` and a loaded
+profile containing exactly `schema_version`, `name`, and `public_query`.
+`public_query` is passed through the same validated `build_request_config`
+surface as `/poster`; private geometry and experiment fields are not accepted.
+The selected Primary and optional Logo then use the unchanged stock compositor.
+IMDb is optional when TMDb can provide the remaining metadata.
+
+Readiness and render responses keep the identities separate:
+
+- `upstream_revision` / `X-Upstream-Revision` is pinned to
+  `9d84d388a426c90ad439a27e01941538856fb85e`;
+- `renderer_revision` / `X-Renderer-Revision` is the full fork commit supplied
+  through `POSTERSPLUS_RENDERER_REVISION`.
+
+Render responses preserve `X-Logo-Source` compatibility and additionally expose
+`X-Logo-Treatment` as `selected_logo`, `provider_logo`, or `title_treatment`.
+Image treatments include `X-Effective-Logo-SHA256`; provider hashes cover the
+exact effective RGBA dimensions and pixels passed to the stock compositor.
+
 ### Operator endpoints
 
 These are gated behind `access_key` when one is configured:
 
 - `GET /stats`: cache row counts / sizes plus live runtime state (in-flight renders, background fetches, MDBList key cooldowns). Handy for spotting issues before they surface.
+- `GET /ready`: authenticated profile, upstream revision, and fork revision readiness.
 - `GET /debug/fallback-gallery`: a gallery of every genre's no-art fallback card (mascot + genre font), also reachable via the **Preview fallback art** button in the configurator's Logo section.
 
 ---

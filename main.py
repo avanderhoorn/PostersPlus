@@ -73,6 +73,8 @@ class _TruncateUrlFilter(logging.Filter):
             path = record.args[2]
             if isinstance(path, str):
                 path = self._KEY_RE.sub(r'\1***', path)
+                if path.startswith("/v1/artwork/candidates?"):
+                    path = "/v1/artwork/candidates?<redacted>"
                 if len(path) > self._MAX:
                     path = path[: self._MAX] + "…"
                 record.args = (record.args[0], record.args[1], path) + record.args[3:]
@@ -618,7 +620,7 @@ from ratings import (
     _score_color_alt,
     _score_color_metal,
 )
-from tmdb import composite_logo, logo_centre_y, fetch_logo, image_language_order, fetch_poster_metadata, fetch_poster_image, fetch_backdrop_image, fetch_landscape_image, fetch_trending_rank, fetch_trending_candidates, fetch_popular_candidates, fetch_supplemental_candidates, fetch_catalog_candidates, fetch_release_status, fetch_recent_movie_digital_release_date, svg_logo_supported, tmdb_metadata_cache_key, _CROP_VERSION, _fetch_metahub_logo, LOGO_ABS_MAX_H, TEXT_FORWARD_PRIORITIES as _TEXT_FORWARD_LOGO_PRIORITIES
+from tmdb import normalise_poster, composite_logo, logo_centre_y, fetch_logo, image_language_order, fetch_poster_metadata, fetch_poster_image, fetch_backdrop_image, fetch_landscape_image, fetch_trending_rank, fetch_trending_candidates, fetch_popular_candidates, fetch_supplemental_candidates, fetch_catalog_candidates, fetch_release_status, fetch_recent_movie_digital_release_date, svg_logo_supported, tmdb_metadata_cache_key, _CROP_VERSION, _fetch_metahub_logo, LOGO_ABS_MAX_H, TEXT_FORWARD_PRIORITIES as _TEXT_FORWARD_LOGO_PRIORITIES
 
 # Logo priorities that consult the secondary preferred language ("custom").
 # Elsewhere the secondary language is inert and must be kept out of the image
@@ -629,6 +631,35 @@ _SECONDARY_LANGUAGE_PRIORITIES = frozenset({
 })
 import tvdb
 import anime
+from artwork_candidates import (
+    CandidateDiscoveryError,
+    MAX_BODY_BYTES as CANDIDATE_MAX_BODY_BYTES,
+    decode_request_body as decode_candidate_request_body,
+    discover_candidates,
+    discovery_key_matches,
+    normalized_title_digest,
+    shutdown_candidate_ocr_executor,
+)
+from private_adapter import (
+    SelectedImage as _SelectedImage,
+    SelectionContext as _SelectionContext,
+    SelectionEnvelope as _SelectionEnvelope,
+    SelectionError as _SelectionError,
+    access_key_matches as _access_key_matches,
+    decode_selected_image as _decode_selected_image,
+    decode_selection_envelope as _decode_selection_envelope,
+    effective_logo_sha256 as _effective_logo_sha256,
+    encode_rendered_image as _encode_rendered_image,
+    image_response as _image_response,
+    output_format_supported as _output_format_supported,
+    read_bounded_body as _read_bounded_body,
+    read_selection_body as _read_selection_body,
+    renderer_identity as _renderer_identity,
+)
+from render_profile import (
+    RenderProfile,
+    load_render_profile,
+)
 
 # ---------------------------------------------------------------------------
 # Persistent HTTP client
@@ -669,19 +700,34 @@ def _make_http_client() -> httpx.AsyncClient:
 # Input validation
 # ---------------------------------------------------------------------------
 
-_TMDB_ID_RE  = re.compile(r'^\d{1,10}$')
-_IMDB_ID_RE  = re.compile(r'^tt\d{1,10}$')
+_TMDB_ID_RE  = re.compile(r'^[1-9][0-9]{0,19}$')
+_IMDB_ID_RE  = re.compile(r'^tt[0-9]{1,20}$')
 _VALID_TYPES = frozenset({"movie", "tv", "series"})
+_SELECTED_OCR_POLICY_REVISION = "selected-primary-v2"
 
 
 def _check_tmdb_id(val: str) -> None:
-    if not _TMDB_ID_RE.match(val):
+    if not _TMDB_ID_RE.fullmatch(val):
         raise HTTPException(status_code=400, detail="Invalid tmdb_id")
 
 
 def _check_imdb_id(val: str) -> None:
-    if not _IMDB_ID_RE.match(val):
+    if not _IMDB_ID_RE.fullmatch(val):
         raise HTTPException(status_code=400, detail="Invalid imdb_id")
+
+
+def _selected_ocr_cache_key(
+    selected_sha256: str,
+    titles: tuple[str, ...],
+) -> str:
+    from text_detect import DETECT_RES_SIG
+
+    return (
+        f"selected:{selected_sha256}:{_SELECTED_OCR_POLICY_REVISION}:"
+        f"{DETECT_RES_SIG}:normalized-titles-v1:"
+        f"{normalized_title_digest(titles)}:"
+        f"{_cfg.PPOCR_BOX_THRESHOLD:.4f}"
+    )
 
 
 def _normalise_optional_id(raw: str | None, name: str) -> str:
@@ -1535,6 +1581,39 @@ def build_request_config(params: dict) -> RequestConfig:
     cfg.sash_text_color      = _parse_hex_color(params.get("sash_text_color"))
 
     return cfg
+
+
+# ---------------------------------------------------------------------------
+# Private production render profile
+# ---------------------------------------------------------------------------
+
+_PROFILE_QUERY_ALIASES = frozenset({
+    "badge_pos",
+    "combined_badge_min_score",
+    "logo_native_fallback",
+    "primary_client",
+    "show_quality_badges",
+    "vignette_poster_color",
+})
+_PROFILE_QUERY_UNPARSED_FIELDS = frozenset({"landscape_badge_pos"})
+_PROFILE_QUERY_KEY_HINTS = {
+    "landscape_badge_pos": "use the badge_pos query alias instead",
+}
+_PROFILE_QUERY_FIELDS = (
+    frozenset(RequestConfig.__dataclass_fields__) - _PROFILE_QUERY_UNPARSED_FIELDS
+) | _PROFILE_QUERY_ALIASES
+
+_render_profile: RenderProfile | None = None
+
+
+def _load_configured_render_profile() -> RenderProfile | None:
+    if not _cfg.RENDER_PROFILE_PATH:
+        return None
+    return load_render_profile(
+        _cfg.RENDER_PROFILE_PATH,
+        _PROFILE_QUERY_FIELDS,
+        key_hints=_PROFILE_QUERY_KEY_HINTS,
+    )
 
 
 # ---------------------------------------------------------------------------
@@ -3997,6 +4076,7 @@ async def _cache_warm_loop(digital_release_ready: asyncio.Event | None = None) -
 async def lifespan(app: FastAPI):
     global _HTTP_CLIENT, _configurator_html, _render_assets_signature
     global _background_detection_queue, _background_detection_task
+    global _render_profile
     init_db()
     logger.info(f"Cache initialised (composite TTL {_cfg.COMPOSITE_CACHE_TTL}s / "
                 f"{_cfg.COMPOSITE_CACHE_TTL / 86400:.1f}d)")
@@ -4028,6 +4108,13 @@ async def lifespan(app: FastAPI):
     if _quality_source == "qualicache" and _cfg.QUALICACHE_URL:
         logger.info(f"Quality source: QualiCache at {_cfg.QUALICACHE_URL}")
     _configurator_html = _load_configurator_html()
+    _render_profile = _load_configured_render_profile()
+    if _render_profile is not None:
+        logger.info(
+            "Render profile loaded: %s (%s)",
+            _render_profile.name,
+            _render_profile.digest,
+        )
     load_languages()   # poster-output translations (English fallback if absent)
     _render_assets_signature = _compute_render_assets_signature()
     # Count the genre fallback backgrounds without decoding them.  These are only
@@ -4111,11 +4198,41 @@ async def lifespan(app: FastAPI):
     _background_detection_queue = None
     _background_detection_keys.clear()
     _shutdown_detect_executor()
+    shutdown_candidate_ocr_executor()
     await _HTTP_CLIENT.aclose()
     logger.info("HTTP client closed")
 
 
 app = FastAPI(lifespan=lifespan)
+
+
+@app.exception_handler(_SelectionError)
+async def _selection_error_response(_request: Request, exc: _SelectionError):
+    response = JSONResponse(
+        status_code=exc.status_code,
+        content={"error": {"code": exc.code, "message": exc.message}},
+    )
+    response.headers["Cache-Control"] = "no-store"
+    response.headers["Pragma"] = "no-cache"
+    return response
+
+
+@app.exception_handler(CandidateDiscoveryError)
+async def _candidate_error_response(
+    _request: Request,
+    exc: CandidateDiscoveryError,
+):
+    logger.warning("Artwork discovery rejected: reason=%s", exc.code)
+    response = JSONResponse(
+        status_code=exc.status_code,
+        content={"error": {"code": exc.code, "message": exc.message}},
+    )
+    response.headers["Cache-Control"] = "no-store"
+    if exc.status_code == 429:
+        response.headers["Retry-After"] = "60"
+    return response
+
+
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))
 _FONTS_DIR = os.path.join(BASE_DIR, "fonts")
 
@@ -4212,6 +4329,34 @@ def _normalise_fallback_canvas(image: Image.Image) -> Image.Image:
 
 
 app.mount("/static", StaticFiles(directory=os.path.join(BASE_DIR, "static")), name="static")
+
+
+@app.middleware("http")
+async def private_path_guard(request: Request, call_next):
+    if request.url.path not in {"/ready", "/render/selection"}:
+        return await call_next(request)
+    if not _cfg.ACCESS_KEY:
+        response = JSONResponse(
+            status_code=503,
+            content={
+                "error": {
+                    "code": "renderer_unavailable",
+                    "message": "ACCESS_KEY must be configured for private routes",
+                }
+            },
+        )
+    elif not _access_key_matches(
+        request.headers.get("x-jellyfin-artwork-key", "")
+    ):
+        response = JSONResponse(
+            status_code=403,
+            content={"error": {"code": "unauthorized", "message": "Unauthorized"}},
+        )
+    else:
+        response = await call_next(request)
+    response.headers["Cache-Control"] = "no-store"
+    response.headers["Pragma"] = "no-cache"
+    return response
 
 
 @app.middleware("http")
@@ -4396,6 +4541,113 @@ def _load_configurator_html() -> str:
 async def health_check():
     """Lightweight liveness probe — no auth required, used by Docker healthcheck."""
     return {"status": "ok"}
+
+
+def _text_detector_ready() -> bool:
+    from text_detect import text_detection_ready
+    return text_detection_ready()
+
+
+@app.get("/ready")
+async def readiness(request: Request):
+    if request.query_params:
+        raise _SelectionError(
+            400,
+            "invalid_request",
+            "Readiness does not accept query parameters",
+        )
+    identity = _renderer_identity()
+    ready = (
+        _HTTP_CLIENT is not None
+        and _render_profile is not None
+        and identity is not None
+        and (
+            not _cfg.TEXTLESS_TEXT_DETECTION
+            or _text_detector_ready()
+        )
+    )
+    upstream_revision, renderer_revision = (
+        identity if identity is not None else (_cfg.UPSTREAM_REVISION, None)
+    )
+    response = JSONResponse(
+        content={
+            "status": "ready" if ready else "starting",
+            "upstream_revision": upstream_revision,
+            "renderer_revision": renderer_revision,
+            "profile": (
+                {
+                    "schema_version": _render_profile.schema_version,
+                    "name": _render_profile.name,
+                    "digest": _render_profile.digest,
+                    "public_query": dict(_render_profile.public_query),
+                }
+                if _render_profile is not None
+                else None
+            ),
+        },
+        status_code=200 if ready else 503,
+    )
+    response.headers["Cache-Control"] = "no-store"
+    return response
+
+
+@app.post("/v1/artwork/candidates")
+async def artwork_candidates(request: Request):
+    discovery_key = request.headers.get(
+        "x-jellyfin-artwork-discovery-key", ""
+    )
+    if not discovery_key_matches(discovery_key):
+        raise CandidateDiscoveryError(403, "unauthorized", "Unauthorized")
+    if request.query_params:
+        raise CandidateDiscoveryError(
+            400,
+            "invalid_query",
+            "Artwork discovery does not accept query parameters",
+        )
+    content_type = request.headers.get("content-type", "")
+    if content_type.split(";", 1)[0].strip().lower() != "application/json":
+        raise CandidateDiscoveryError(
+            415,
+            "invalid_content_type",
+            "Content-Type must be application/json",
+        )
+    try:
+        body = await _read_bounded_body(
+            request,
+            max_bytes=CANDIDATE_MAX_BODY_BYTES,
+            empty_message="Artwork discovery body is empty",
+            too_large_message="Artwork discovery body is too large",
+        )
+    except HTTPException as exc:
+        raise CandidateDiscoveryError(
+            exc.status_code,
+            "body_too_large" if exc.status_code == 413 else "invalid_body",
+            str(exc.detail),
+        ) from exc
+    candidate_request = decode_candidate_request_body(body)
+    if _HTTP_CLIENT is None:
+        raise CandidateDiscoveryError(
+            503,
+            "service_unavailable",
+            "Artwork discovery is not ready",
+        )
+    response, outcome = await discover_candidates(
+        _HTTP_CLIENT,
+        candidate_request,
+    )
+    logger.info(
+        "Artwork discovery complete: type=%s image_type=%s "
+        "tmdb=%s fanart=%s count=%d outcome=%s",
+        candidate_request.media_type,
+        candidate_request.image_type,
+        response["sources"].get("tmdb", "unknown"),
+        response["sources"].get("fanart", "unknown"),
+        len(response["candidates"]),
+        outcome,
+    )
+    result = JSONResponse(content=response)
+    result.headers["Cache-Control"] = "no-store"
+    return result
 
 
 @app.get("/stats")
@@ -4843,7 +5095,16 @@ async def get_poster(
     debug: str | None = None,
     nocache: str | None = None,
 ):
-    if _cfg.ACCESS_KEY and not hmac.compare_digest(access_key, _cfg.ACCESS_KEY):
+    selection_context: _SelectionContext | None = getattr(
+        request.state,
+        "selection_context",
+        None,
+    )
+    if (
+        selection_context is None
+        and _cfg.ACCESS_KEY
+        and not hmac.compare_digest(access_key, _cfg.ACCESS_KEY)
+    ):
         raise HTTPException(status_code=403, detail="Unauthorized, your access key is not valid for this instance.")
 
     _check_type(type)
@@ -4866,7 +5127,7 @@ async def get_poster(
     # early when anime sources are disabled, and this is not an anime concern.
     if not imdb_id and stremio_id:
         _stremio_hint = stremio_id.strip()
-        if _IMDB_ID_RE.match(_stremio_hint):
+        if _IMDB_ID_RE.fullmatch(_stremio_hint):
             imdb_id = _stremio_hint
 
     # -----------------------------------------------------------------------
@@ -4992,21 +5253,30 @@ async def get_poster(
             ),
         )
 
-    raw_params = {
-        k: v for k, v in request.query_params.items()
-        if k not in (
-            "tmdb_id", "imdb_id", "anilist_id", "kitsu_id", "stremio_id",
-            # Not art sources here (MAL needs auth, AniDB's API is heavily
-            # restricted), but AIOMetadata templates carry the full placeholder
-            # set. Excluded so their presence — substituted or not — can't
-            # fragment the composite cache key across otherwise identical
-            # requests.
-            "mal_id", "anidb_id",
-            "mdblist_key", "tmdb_key", "type",
-            "quality", "season", "episode", "access_key", "debug", "nocache",
-        )
-    }
+    if selection_context is not None:
+        raw_params = dict(selection_context.profile.public_query)
+    else:
+        raw_params = {
+            k: v for k, v in request.query_params.items()
+            if k not in (
+                "tmdb_id", "imdb_id", "anilist_id", "kitsu_id", "stremio_id",
+                # Not art sources here (MAL needs auth, AniDB's API is heavily
+                # restricted), but AIOMetadata templates carry the full placeholder
+                # set. Excluded so their presence — substituted or not — can't
+                # fragment the composite cache key across otherwise identical
+                # requests.
+                "mal_id", "anidb_id",
+                "mdblist_key", "tmdb_key", "type",
+                "quality", "season", "episode", "access_key", "debug", "nocache",
+            )
+        }
     rcfg = build_request_config(raw_params)
+    if selection_context is not None and selection_context.logo is not None and rcfg.textless:
+        raise _SelectionError(
+            409,
+            "selected_logo_disabled_by_profile",
+            "The active render profile disables Logo composition",
+        )
 
     # Anime is essentially always Japanese, so the foreign-language slot says
     # nothing here — but ranked highly (a reasonable choice for live-action,
@@ -5037,7 +5307,11 @@ async def get_poster(
     # all rendering parameters so different visual configs don't collide.
     # Skipped when an explicit quality= override is supplied (one-off).
     # ------------------------------------------------------------------
-    if not quality and not _cfg.DISABLE_COMPOSITE_CACHE:
+    if (
+        selection_context is None
+        and not quality
+        and not _cfg.DISABLE_COMPOSITE_CACHE
+    ):
         # Server-side detection settings affect the rendered output but aren't URL
         # params, so fold a signature into the hash.  Toggling detection or
         # changing its thresholds then auto-busts stale composites (and leaves
@@ -5460,7 +5734,11 @@ async def get_poster(
         # poster — OR, when no poster art exists at all, a genre-tinted canvas.
         #   poster missing entirely  → prefer backdrop over the canvas
         #   poster exists with text  → prefer backdrop over the text-burned poster
-        _use_backdrop = bool(backdrop_path) and (poster_path is None or not is_textless)
+        _use_backdrop = (
+            selection_context is None
+            and bool(backdrop_path)
+            and (poster_path is None or not is_textless)
+        )
         if _use_backdrop:
             logger.info(f"No textless poster for {tmdb_id} — using backdrop crop as portrait fallback")
             is_textless = True          # backdrop is textless; enable logo compositing
@@ -5497,7 +5775,11 @@ async def get_poster(
             _orig_art = _p_default or next(iter(_ranked_posters), None)
         else:
             _orig_art = next(iter(_ranked_posters), None) or _p_default
-        _use_original_art = rcfg.use_original_art and bool(_orig_art)
+        _use_original_art = (
+            selection_context is None
+            and rcfg.use_original_art
+            and bool(_orig_art)
+        )
         if _use_original_art:
             poster_path   = _orig_art
             is_textless   = False
@@ -5600,7 +5882,9 @@ async def get_poster(
         _backdrop_rescued = False
         _detection_deferred = False
         _vc = tmdb_data.get("vote_count")
-        _vote_detection_ok = _detection_vote_ok(_vc)
+        _vote_detection_ok = (
+            selection_context is not None or _detection_vote_ok(_vc)
+        )
 
         async def _tvdb_is_clean(cand_image, art_id, *, source="backdrop", kind="bd") -> bool:
             """Inline burned-in-text vet for a TVDB candidate (background or poster),
@@ -5646,7 +5930,14 @@ async def get_poster(
         # must key off; deciding it from cfg.landscape_art downstream is how
         # these fallbacks ended up rendering with no title at all.
         # ------------------------------------------------------------------
-        if _is_landscape:
+        if selection_context is not None:
+            is_textless = True
+            is_no_poster = False
+            _use_backdrop = False
+            _image_coro = _resolved(
+                normalise_poster(selection_context.primary.image.copy())
+            )
+        elif _is_landscape:
             _ls_text_bd = tmdb_data.get("text_backdrop_path")
             if rcfg.landscape_art == "original":
                 _ls_path = _ls_text_bd or backdrop_path
@@ -5826,7 +6117,15 @@ async def get_poster(
         if _scan_selected_image:
             from text_detect import DETECT_RES_SIG
 
-            if _use_backdrop:
+            if selection_context is not None:
+                _det_src = f"selected:{selection_context.primary.sha256}"
+                _det_key = _selected_ocr_cache_key(
+                    selection_context.primary.sha256,
+                    _text_titles,
+                )
+                _image_cache_key = ""
+                _det_source = "poster"
+            elif _use_backdrop:
                 _crop_variant = "ta" if _backdrop_avoid_text else "plain"
                 _det_src = f"bd:{backdrop_path}:{_CROP_VERSION}:{_crop_variant}"
                 _image_cache_key = (
@@ -5839,9 +6138,10 @@ async def get_poster(
                 _image_cache_key = f"{type}_{tmdb_id}_{poster_path.strip('/')}"
                 _det_source = "poster"
 
-            _det_key = (
-                f"{_det_src}|conf={_cfg.PPOCR_BOX_THRESHOLD}:{DETECT_RES_SIG}"
-            )
+            if _det_key is None:
+                _det_key = (
+                    f"{_det_src}|conf={_cfg.PPOCR_BOX_THRESHOLD}:{DETECT_RES_SIG}"
+                )
             _detection_result = get_cached_text_detection(_det_key)
             if _detection_result is None:
                 _base_image_coro = _image_coro
@@ -5937,7 +6237,13 @@ async def get_poster(
             trending_rank,
         ) = await asyncio.gather(
             _image_coro,
-            _resolve_logo() if (is_textless and not is_no_poster) else _resolved(None),
+            (
+                _resolved(selection_context.logo.image.copy())
+                if selection_context is not None and selection_context.logo is not None
+                else _resolve_logo()
+            )
+            if (is_textless and not is_no_poster)
+            else _resolved(None),
             rating_coro,
             # Trending rank is a TMDB list lookup, so it needs a real tmdb_id —
             # which AIOMetadata does send alongside the anime id when it has one.
@@ -6336,6 +6642,16 @@ async def get_poster(
             _suppress_overlay = _detection_result
             if _suppress_overlay is None and _detection_task is not None:
                 _suppress_overlay = await asyncio.shield(_detection_task)
+            if (
+                _suppress_overlay is None
+                and selection_context is not None
+                and selection_context.logo is not None
+            ):
+                raise _SelectionError(
+                    503,
+                    "text_detection_unavailable",
+                    "Text detection is unavailable or uncertain",
+                )
 
             if _detection_deferred:
                 logger.info(
@@ -6345,7 +6661,17 @@ async def get_poster(
                 )
                 _suppress_overlay = False
             elif _suppress_overlay is True:
-                if not _use_backdrop and poster_path:
+                if selection_context is not None and selection_context.logo is not None:
+                    raise _SelectionError(
+                        422,
+                        "selected_primary_contains_text",
+                        "Selected Primary contains title text",
+                    )
+                if (
+                    selection_context is None
+                    and not _use_backdrop
+                    and poster_path
+                ):
                     from textless_report import report_fake_textless_poster
                     report_fake_textless_poster(
                         media_type=type,
@@ -6391,10 +6717,30 @@ async def get_poster(
             # unknown poster keeps its existing appearance.
             has_burned_in_text=(_suppress_overlay is True),
         )
+        if selection_context is not None:
+            effective_logo = _bp_args["logo"]
+            if selection_context.logo is not None:
+                selection_context.effective_treatment = "selected_logo"
+                selection_context.effective_logo_sha256 = (
+                    selection_context.logo.sha256
+                )
+            elif effective_logo is not None:
+                selection_context.effective_treatment = "provider_logo"
+                selection_context.effective_logo_sha256 = (
+                    _effective_logo_sha256(effective_logo)
+                )
+            else:
+                selection_context.effective_treatment = "title_treatment"
+                selection_context.effective_logo_sha256 = None
 
         def _composite_and_encode() -> bytes:
             _render = build_landscape if _is_landscape else build_poster
             result = _render(image, score, genre, rcfg, **_bp_args)
+            if selection_context is not None:
+                return _encode_rendered_image(
+                    result,
+                    selection_context.output_format,
+                )
             buf = io.BytesIO()
             _quality = _cfg.WEBP_QUALITY if _cfg.IMAGE_FORMAT == "webp" else _cfg.JPEG_QUALITY
             result.convert("RGB").save(buf, format=_cfg.IMAGE_FORMAT.upper(), quality=_quality)
@@ -6453,8 +6799,17 @@ async def get_poster(
         if _render_fut is not None:
             _render_fut.set_result((img_bytes, _render_provisional))
 
+        if selection_context is not None:
+            return _image_response(
+                img_bytes,
+                selection_context.output_format,
+            )
         return _poster_response(request, img_bytes, final_cache_key, _render_provisional)
 
+    except _SelectionError as exc:
+        if _render_fut is not None and not _render_fut.done():
+            _render_fut.set_exception(exc)
+        raise
     except ValueError as exc:
         if _render_fut is not None and not _render_fut.done():
             _render_fut.set_exception(exc)
@@ -6499,3 +6854,167 @@ async def get_poster(
             _rating_fetch_inflight.pop(canonical_id, None)
         if final_cache_key is not None:
             _render_inflight.pop(final_cache_key, None)
+
+
+_PRIVATE_RENDER_QUERY = frozenset({
+    "episode",
+    "imdb_id",
+    "output_format",
+    "profile",
+    "quality",
+    "season",
+    "tmdb_id",
+    "type",
+})
+
+
+def _validate_private_render_request(
+    request: Request,
+    *,
+    profile: str,
+    tmdb_id: str,
+    imdb_id: str,
+    media_type: str,
+    season: int,
+    episode: int,
+    output_format: str,
+) -> tuple[RenderProfile, str]:
+    try:
+        _check_tmdb_id(tmdb_id)
+        if imdb_id:
+            _check_imdb_id(imdb_id)
+        _check_type(media_type)
+    except HTTPException as exc:
+        raise _SelectionError(
+            exc.status_code,
+            "invalid_request",
+            str(exc.detail),
+        ) from exc
+    normalized_output_format = output_format.lower()
+    if not _output_format_supported(normalized_output_format):
+        raise _SelectionError(400, "invalid_request", "Invalid output_format")
+    if season < 1 or episode < 1:
+        raise _SelectionError(
+            400,
+            "invalid_request",
+            "season and episode must be positive",
+        )
+    if not _access_key_matches(
+        request.headers.get("x-jellyfin-artwork-key", "")
+    ):
+        raise _SelectionError(403, "unauthorized", "Unauthorized")
+    if _renderer_identity() is None:
+        raise _SelectionError(
+            503,
+            "renderer_unavailable",
+            "POSTERSPLUS_RENDERER_REVISION must be a distinct full commit SHA",
+        )
+    render_profile = _render_profile
+    if render_profile is None:
+        raise _SelectionError(
+            503,
+            "renderer_unavailable",
+            "Render profile is not loaded",
+        )
+    if profile != render_profile.name:
+        raise _SelectionError(404, "unknown_profile", "Unknown render profile")
+    if build_request_config(render_profile.public_query).shape != "portrait":
+        raise _SelectionError(
+            409,
+            "selected_shape_unsupported",
+            "Selected-input rendering requires the stock portrait compositor",
+        )
+    unknown_query = sorted(set(request.query_params) - _PRIVATE_RENDER_QUERY)
+    if unknown_query:
+        raise _SelectionError(
+            400,
+            "invalid_request",
+            f"Unsupported query parameters: {', '.join(unknown_query)}",
+        )
+    return render_profile, normalized_output_format
+
+
+def _apply_private_render_headers(
+    response: Response,
+    context: _SelectionContext,
+) -> None:
+    identity = _renderer_identity()
+    if identity is None or context.effective_treatment is None:
+        raise _SelectionError(
+            503,
+            "renderer_unavailable",
+            "Renderer identity or effective treatment is unavailable",
+        )
+    upstream_revision, renderer_revision = identity
+    response.headers["X-Render-Profile-SHA256"] = context.profile.digest
+    response.headers["X-Upstream-Revision"] = upstream_revision
+    response.headers["X-Renderer-Revision"] = renderer_revision
+    response.headers["X-Selected-Primary-SHA256"] = context.primary.sha256
+    response.headers["X-Logo-Source"] = (
+        "selected" if context.logo is not None else "provider"
+    )
+    response.headers["X-Logo-Treatment"] = context.effective_treatment
+    if context.logo is not None:
+        response.headers["X-Selected-Logo-SHA256"] = context.logo.sha256
+    if context.effective_logo_sha256 is not None:
+        response.headers["X-Effective-Logo-SHA256"] = (
+            context.effective_logo_sha256
+        )
+    response.headers["Cache-Control"] = "no-store"
+    response.headers["Pragma"] = "no-cache"
+
+
+@app.post("/render/selection")
+async def render_selection(
+    request: Request,
+    profile: str,
+    tmdb_id: str,
+    imdb_id: str = "",
+    type: str = "movie",
+    quality: str = "",
+    season: int = 1,
+    episode: int = 1,
+    output_format: str = "jpeg",
+):
+    render_profile, normalized_output_format = _validate_private_render_request(
+        request,
+        profile=profile,
+        tmdb_id=tmdb_id,
+        imdb_id=imdb_id,
+        media_type=type,
+        season=season,
+        episode=episode,
+        output_format=output_format,
+    )
+    body = await _read_selection_body(request)
+    selection = await asyncio.get_running_loop().run_in_executor(
+        None,
+        _decode_selection_envelope,
+        body,
+    )
+    if selection.logo is not None and (
+        not _cfg.TEXTLESS_TEXT_DETECTION or not _text_detector_ready()
+    ):
+        raise _SelectionError(
+            503,
+            "text_detection_unavailable",
+            "Text detection must be ready for an explicit selected Logo",
+        )
+    context = _SelectionContext(
+        primary=selection.primary,
+        logo=selection.logo,
+        profile=render_profile,
+        output_format=normalized_output_format,
+    )
+    request.state.selection_context = context
+    response = await get_poster(
+        request=request,
+        tmdb_id=tmdb_id,
+        imdb_id=imdb_id,
+        type=type,
+        quality=quality,
+        season=season,
+        episode=episode,
+    )
+    _apply_private_render_headers(response, context)
+    return response
