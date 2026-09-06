@@ -109,6 +109,43 @@ PREVIEW_AT_RESOLUTION = _env('PREVIEW_AT_RESOLUTION', "false", group='Access & s
 QUALITY_SOURCE        = _env('QUALITY_SOURCE', "aiostreams", group='Quality source', kind='choice', label='Quality source', help='Where stream-quality badges come from. QualiCache never scrapes on the request path; a cold title returns pending instead of blocking.', choices=('aiostreams', 'scraper', 'qualicache')).lower().strip()
 AIOSTREAMS_URL        = _env('AIOSTREAMS_URL', "", group='Quality source', show_if=('QUALITY_SOURCE', 'aiostreams'), kind='url', label='AIOStreams URL', help='Base URL of your AIOStreams instance. Used when the quality source is aiostreams.', placeholder='https://aiostreams.example.com')
 AIOSTREAMS_AUTH       = _env('AIOSTREAMS_AUTH', "", group='Quality source', show_if=('QUALITY_SOURCE', 'aiostreams'), kind='secret', label='AIOStreams auth', help='AIOStreams credentials as Base64 user:password.')
+# Homestack selected-input adapter (private renderer routes). Read straight
+# from the environment, not _env, so these never appear in the admin settings.
+JELLYFIN_ARTWORK_DISCOVERY_KEY = os.environ.get(
+    "JELLYFIN_ARTWORK_DISCOVERY_KEY", ""
+).strip()
+JELLYFIN_ARTWORK_FANART_PROJECT_API_KEY = os.environ.get(
+    "JELLYFIN_ARTWORK_FANART_PROJECT_API_KEY", ""
+).strip()
+JELLYFIN_ARTWORK_FANART_CLIENT_KEY = os.environ.get(
+    "JELLYFIN_ARTWORK_FANART_CLIENT_KEY", ""
+).strip()
+RENDER_PROFILE_PATH   = os.environ.get("RENDER_PROFILE_PATH", "").strip()
+UPSTREAM_REVISION     = "fb08ed4b2a4d49ad013d4bd716ddef3d871a5acf"
+RENDERER_REVISION     = os.environ.get(
+    "POSTERSPLUS_RENDERER_REVISION", ""
+).strip().lower()
+SELECTED_MAX_BYTES    = max(
+    1, int(os.environ.get("SELECTED_MAX_BYTES", str(10 * 1024 * 1024)))
+)
+SELECTION_MAX_BYTES   = max(
+    1,
+    int(
+        os.environ.get(
+            "SELECTION_MAX_BYTES",
+            str(2 * (4 * ((SELECTED_MAX_BYTES + 2) // 3)) + 4096),
+        )
+    ),
+)
+SELECTED_MAX_WIDTH    = max(
+    1, int(os.environ.get("SELECTED_MAX_WIDTH", "8000"))
+)
+SELECTED_MAX_HEIGHT   = max(
+    1, int(os.environ.get("SELECTED_MAX_HEIGHT", "8000"))
+)
+SELECTED_MAX_PIXELS   = max(
+    1, int(os.environ.get("SELECTED_MAX_PIXELS", "20000000"))
+)
 
 # Quality source selection.
 # QUALITY_SOURCE:   "aiostreams" (default), "scraper", or "qualicache".
