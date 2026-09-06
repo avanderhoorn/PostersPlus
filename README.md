@@ -138,6 +138,51 @@ Quality badges are optional. Choose a source in the dashboard's **Quality source
 
 Plex and Jellyfin users get quality from their own files through the sync scripts, so they don't need any of these.
 
+## Private Jellyfin artwork adapter (Homestack fork)
+
+This fork adds private routes for a Jellyfin artwork controller. They are
+authenticated by their own headers and do not change `/poster`.
+
+`POST /v1/artwork/candidates` accepts strict schema 1 (Primary) and schema 2
+(typed `Primary` or `Logo`) requests authenticated with
+`X-Jellyfin-Artwork-Discovery-Key`. It validates exact TMDb/IMDb/TVDB
+identities, maps Movies and Series to their provider endpoints, screens bounded
+assets, alternates TMDb and Fanart.tv results, and returns at most eight
+canonical credential-free HTTPS URLs. Discovery has bounded concurrency,
+rate admission, a 20-second deadline, and separate complete/partial cache TTLs.
+
+`POST /render/selection` accepts the exact schema-1 Primary and optional Logo
+bytes selected in Jellyfin. It requires `X-Jellyfin-Artwork-Key` and a loaded
+profile containing exactly `schema_version`, `name`, and `public_query`.
+`public_query` is passed through the same validated `build_request_config`
+surface as `/poster`; private geometry and experiment fields are not accepted.
+The selected Primary and optional Logo then use the unchanged stock compositor.
+IMDb is optional when TMDb can provide the remaining metadata.
+
+`GET /ready` (same key) reports the loaded profile digest and both revisions,
+which stay separate in readiness and render responses:
+
+- `upstream_revision` / `X-Upstream-Revision` is pinned to
+  `fb08ed4b2a4d49ad013d4bd716ddef3d871a5acf`;
+- `renderer_revision` / `X-Renderer-Revision` is the full fork commit supplied
+  through `POSTERSPLUS_RENDERER_REVISION`.
+
+Render responses preserve `X-Logo-Source` compatibility and additionally expose
+`X-Logo-Treatment` as `selected_logo`, `provider_logo`, or `title_treatment`.
+Image treatments include `X-Effective-Logo-SHA256`; provider hashes cover the
+exact effective RGBA dimensions and pixels passed to the stock compositor.
+
+These settings are read from the environment only, never from the dashboard:
+
+| Variable | Default | Description |
+|---|---|---|
+| `JELLYFIN_ARTWORK_DISCOVERY_KEY` | derived | Optional discovery-only key. When unset, it is HMAC-SHA256-derived from `ACCESS_KEY` with the fixed `jellyfin-artwork-discovery-v1` context |
+| `JELLYFIN_ARTWORK_FANART_PROJECT_API_KEY` | - | Fanart.tv project key used only by bounded candidate discovery |
+| `JELLYFIN_ARTWORK_FANART_CLIENT_KEY` | - | Fanart.tv client key used only by bounded candidate discovery |
+| `RENDER_PROFILE_PATH` | - | Read-only schema-2 YAML profile for `POST /render/selection` |
+| `POSTERSPLUS_RENDERER_REVISION` | - | Full 40-character fork commit, supplied by the image build |
+| `SELECTED_MAX_BYTES` / `_WIDTH` / `_HEIGHT` / `_PIXELS` | 10 MiB / 8000 / 8000 / 20 MP | Bounds on a selected input image |
+
 ## Documentation
 
 - [CONFIGURATION.md](CONFIGURATION.md): every setting and environment variable, QualiCache, the watchlist marker, caching and cache warming, and Plex/Jellyfin sync.
