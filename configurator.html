@@ -3032,6 +3032,7 @@ try{if(localStorage.getItem('postersplus_theme')==='light')document.documentElem
             <div class="field" id="badge-min-score-field" style="display:none">
               <label class="field-label">Minimum Quality to Display</label>
               <select id="cfg-badge-min-score" onchange="this.dataset.userSet='true'; build(); queuePreviewReload()">
+                <option value="1">Any recognized quality</option>
                 <option value="2">HD Web</option>
                 <option value="3">One of 4K, HDR or Remux</option>
                 <option value="4">Two of the above or DV</option>

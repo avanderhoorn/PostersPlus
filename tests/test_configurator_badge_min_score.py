@@ -43,6 +43,18 @@ class BadgeMinScoreStickinessTests(unittest.TestCase):
         self.assertIsNotNone(select, "cfg-badge-min-score select not found")
         self.assertIn("dataset.userSet", select.group(1))
 
+    def test_any_recognized_quality_option_is_available(self):
+        select = re.search(
+            r'<select id="cfg-badge-min-score"[^>]*>(.*?)</select>',
+            self.html,
+            re.S,
+        )
+        self.assertIsNotNone(select, "cfg-badge-min-score select not found")
+        self.assertIn(
+            '<option value="1">Any recognized quality</option>',
+            select.group(1),
+        )
+
     def test_imported_minimum_is_marked_user_set(self):
         # An imported URL (and so the localStorage settings restore) is as
         # deliberate as a click, and must survive a later mode change.
