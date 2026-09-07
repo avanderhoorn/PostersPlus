@@ -138,6 +138,8 @@ class ProfileSchemaTests(unittest.TestCase):
         self.assertEqual(config.movie_weights["imdb"], 0.50)
         self.assertEqual(config.tv_weights["trakt"], 0.80)
         self.assertEqual(config.badge_min_score, 1)
+        self.assertEqual(config.badge_anchor_x, 0.040)
+        self.assertEqual(config.badge_anchor_y, 0.030)
         self.assertEqual(config.shape, "portrait")
 
 
@@ -454,6 +456,8 @@ class SelectedPipelineIntegrationTests(unittest.IsolatedAsyncioTestCase):
         ocr_cached: bool | None = False,
         ocr_result: bool | None = False,
         output_format: str = "jpeg",
+        profile_query: dict[str, str] | None = None,
+        quality: str = "4K",
     ) -> tuple[httpx.Response, AsyncMock, bytes, list[str], list[dict]]:
         primary = primary or _image_bytes(
             size=(500, 750), color=(20, 30, 40, 255)
@@ -478,17 +482,20 @@ class SelectedPipelineIntegrationTests(unittest.IsolatedAsyncioTestCase):
                 "vote_count": 100,
             },
         )
+        public_query = {
+            "badge_display_mode": "0",
+            "bottom_gradient": "off",
+            "rating_display_mode": "0",
+            "sash_mode": "hidden",
+            "show_award_sash": "false",
+            "top_gradient": "off",
+        }
+        if profile_query is not None:
+            public_query.update(profile_query)
         profile = RenderProfile(
             schema_version=2,
             name="homestack-default",
-            public_query={
-                "badge_display_mode": "0",
-                "bottom_gradient": "off",
-                "rating_display_mode": "0",
-                "sash_mode": "hidden",
-                "show_award_sash": "false",
-                "top_gradient": "off",
-            },
+            public_query=public_query,
             digest="d" * 64,
         )
         logo_fetch = AsyncMock(
@@ -567,7 +574,8 @@ class SelectedPipelineIntegrationTests(unittest.IsolatedAsyncioTestCase):
             ) as client:
                 response = await client.post(
                     "/render/selection?profile=homestack-default"
-                    "&tmdb_id=550&imdb_id=tt0137523&type=movie&quality=4K"
+                    "&tmdb_id=550&imdb_id=tt0137523&type=movie"
+                    f"&quality={quality}"
                     f"&output_format={output_format}",
                     content=_homestack_envelope(primary, logo),
                     headers={
@@ -699,6 +707,62 @@ class SelectedPipelineIntegrationTests(unittest.IsolatedAsyncioTestCase):
         )
         self.assertEqual(len(detector_calls), 1)
         logo_fetch.assert_not_awaited()
+
+    async def test_title_bearing_primary_suppresses_selected_logo_and_keeps_badge(
+        self,
+    ):
+        primary = _image_bytes(
+            size=(500, 750),
+            color=(20, 30, 40, 255),
+        )
+        logo = _image_bytes(
+            size=(180, 60),
+            color=(230, 230, 230, 255),
+        )
+        profile_query = {
+            "badge_anchor_x": "0.040",
+            "badge_anchor_y": "0.030",
+            "badge_display_mode": "2",
+            "badge_gap": "4",
+            "badge_height": "8",
+            "badge_min_score": "1",
+        }
+        badge = Image.new("RGBA", (12, 8), (220, 30, 40, 255))
+        with patch.object(main, "get_resized_badge", return_value=badge):
+            selected = await self._render_pipeline(
+                logo=logo,
+                provider_logo=None,
+                primary=primary,
+                ocr_cached=None,
+                ocr_result=True,
+                output_format="png",
+                profile_query=profile_query,
+            )
+            without_logo = await self._render_pipeline(
+                logo=None,
+                provider_logo=None,
+                primary=primary,
+                ocr_cached=True,
+                ocr_result=True,
+                output_format="png",
+                profile_query=profile_query,
+            )
+
+        response = selected[0]
+        self.assertEqual(response.status_code, 200, response.text)
+        self.assertEqual(
+            response.headers["x-selected-logo-sha256"],
+            hashlib.sha256(logo).hexdigest(),
+        )
+        self.assertEqual(
+            response.headers["x-logo-treatment"],
+            "burned_in_title",
+        )
+        self.assertNotIn("x-effective-logo-sha256", response.headers)
+        self.assertEqual(response.content, without_logo[0].content)
+        with Image.open(io.BytesIO(response.content)) as rendered:
+            self.assertEqual(rendered.getpixel((20, 22)), (220, 30, 40, 255))
+            self.assertEqual(rendered.getpixel((10, 11)), (20, 30, 40, 255))
 
     async def test_unknown_without_selected_logo_keeps_stock_provider_fallback(self):
         provider_logo = Image.new("RGBA", (180, 60), (240, 240, 240, 255))
