@@ -33,7 +33,7 @@ public_query:
   sash_mode: hidden
   badge_display_mode: 2
   badge_height: 29
-  badge_anchor_x: 0.020
-  badge_anchor_y: 0.015
+  badge_anchor_x: 0.040
+  badge_anchor_y: 0.030
   badge_gap: 4
   badge_min_score: 1

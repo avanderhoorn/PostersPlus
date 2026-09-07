@@ -13277,12 +13277,6 @@ async def get_poster(
                 )
                 _suppress_overlay = False
             elif _suppress_overlay is True:
-                if selection_context is not None and selection_context.logo is not None:
-                    raise _SelectionError(
-                        422,
-                        "selected_primary_contains_text",
-                        "Selected Primary contains title text",
-                    )
                 if (
                     selection_context is None
                     and not _use_backdrop
@@ -13433,7 +13427,7 @@ async def get_poster(
         )
         if selection_context is not None:
             effective_logo = _bp_args["logo"]
-            if selection_context.logo is not None:
+            if effective_logo is not None and selection_context.logo is not None:
                 selection_context.effective_treatment = "selected_logo"
                 selection_context.effective_logo_sha256 = (
                     selection_context.logo.sha256
@@ -13443,6 +13437,9 @@ async def get_poster(
                 selection_context.effective_logo_sha256 = (
                     _effective_logo_sha256(effective_logo)
                 )
+            elif _suppress_overlay is True:
+                selection_context.effective_treatment = "burned_in_title"
+                selection_context.effective_logo_sha256 = None
             else:
                 selection_context.effective_treatment = "title_treatment"
                 selection_context.effective_logo_sha256 = None
