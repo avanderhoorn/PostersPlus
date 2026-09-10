@@ -180,7 +180,15 @@ class DiscoverySettings:
 
     @property
     def fanart_enabled(self) -> bool:
-        return bool(self.fanart_project_api_key and self.fanart_client_key)
+        return bool(self.fanart_project_api_key or self.fanart_client_key)
+
+    def fanart_query_params(self) -> dict[str, str]:
+        params = {}
+        if self.fanart_project_api_key:
+            params["api_key"] = self.fanart_project_api_key
+        if self.fanart_client_key:
+            params["client_key"] = self.fanart_client_key
+        return params
 
 
 class _SearchAdmission:
@@ -490,6 +498,17 @@ def canonical_fanart_url(
     resource: str | None = None,
 ) -> str:
     path = _validate_base_url(url, "assets.fanart.tv")
+    legacy_prefix = "/fanart/"
+    legacy_filename = path.removeprefix(legacy_prefix)
+    if (
+        path.startswith(legacy_prefix)
+        and "/" not in legacy_filename
+        and _FANART_FILE_RE.fullmatch(legacy_filename)
+    ):
+        # Fanart's API still returns legacy flat CDN paths for many assets.
+        # The authenticated title endpoint binds identity; this guard keeps
+        # the fetch restricted to one safe file on the exact asset host.
+        return f"https://assets.fanart.tv{legacy_prefix}{legacy_filename}"
     if media_type == "movie":
         segment = resource or _FANART_MOVIE_POSTER_RESOURCE
         if segment not in _FANART_MOVIE_RESOURCES:
@@ -727,10 +746,7 @@ async def _fanart_candidates(
     payload = await _get_json(
         client,
         f"https://webservice.fanart.tv/v3/{path}",
-        {
-            "api_key": settings.fanart_project_api_key,
-            "client_key": settings.fanart_client_key,
-        },
+        settings.fanart_query_params(),
     )
     if not isinstance(payload, dict):
         raise _SourceFailure("malformed_response")
@@ -845,10 +861,7 @@ async def _fanart_logo_candidates(
     payload = await _get_json(
         client,
         f"https://webservice.fanart.tv/v3/{path}",
-        {
-            "api_key": settings.fanart_project_api_key,
-            "client_key": settings.fanart_client_key,
-        },
+        settings.fanart_query_params(),
     )
     if not isinstance(payload, dict):
         raise _SourceFailure("malformed_response")

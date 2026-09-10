@@ -159,6 +159,7 @@ class UrlPolicyTests(unittest.TestCase):
 
     def test_fanart_urls_reject_unsafe_or_wrong_source_paths(self):
         valid = "https://assets.fanart.tv/fanart/movies/123/movieposter/456.jpg"
+        legacy = "https://assets.fanart.tv/fanart/chocolat-5fd9cd5bcc022.jpg"
         self.assertEqual(
             candidates.canonical_fanart_url(
                 valid,
@@ -167,6 +168,15 @@ class UrlPolicyTests(unittest.TestCase):
                 tvdb_id=None,
             ),
             valid,
+        )
+        self.assertEqual(
+            candidates.canonical_fanart_url(
+                legacy,
+                media_type="movie",
+                tmdb_id="392",
+                tvdb_id=None,
+            ),
+            legacy,
         )
         self.assertEqual(
             candidates.canonical_fanart_url(
@@ -189,6 +199,8 @@ class UrlPolicyTests(unittest.TestCase):
             valid.replace("/123/", "/999/"),
             valid.replace("/movieposter/", "/background/"),
             valid.replace("456.jpg", "nested/456.jpg"),
+            "https://assets.fanart.tv/fanart/nested/chocolat-5fd9cd5bcc022.jpg",
+            "https://assets.fanart.tv/fanart/chocolat-5fd9cd5bcc022.svg",
         )
         for url in invalid:
             with self.subTest(url=url):
@@ -202,6 +214,28 @@ class UrlPolicyTests(unittest.TestCase):
 
 
 class AdapterTests(unittest.IsolatedAsyncioTestCase):
+    def test_fanart_accepts_either_official_key_tier(self):
+        project_only = _settings(fanart_client_key="")
+        self.assertTrue(project_only.fanart_enabled)
+        self.assertEqual(
+            project_only.fanart_query_params(),
+            {"api_key": "fanart-project"},
+        )
+
+        client_only = _settings(fanart_project_api_key="")
+        self.assertTrue(client_only.fanart_enabled)
+        self.assertEqual(
+            client_only.fanart_query_params(),
+            {"client_key": "fanart-client"},
+        )
+
+        disabled = _settings(
+            fanart_project_api_key="",
+            fanart_client_key="",
+        )
+        self.assertFalse(disabled.fanart_enabled)
+        self.assertEqual(disabled.fanart_query_params(), {})
+
     async def test_tmdb_filters_neutral_portraits_ranks_and_caps_at_eight(self):
         posters = []
         for index in range(10):
@@ -300,6 +334,35 @@ class AdapterTests(unittest.IsolatedAsyncioTestCase):
         )
         self.assertEqual(len(values), 1)
         self.assertNotIn("key", values[0].url)
+
+    async def test_fanart_accepts_legacy_flat_asset_paths(self):
+        async def handler(request):
+            self.assertEqual(request.url.path, "/v3/movies/123")
+            return _json_response({
+                "movieposter": [
+                    {
+                        "url": (
+                            "https://assets.fanart.tv/fanart/"
+                            "chocolat-5fd9cd5bcc022.jpg"
+                        ),
+                        "lang": "00",
+                        "likes": "2",
+                    },
+                ]
+            })
+
+        async with httpx.AsyncClient(transport=httpx.MockTransport(handler)) as client:
+            values = await candidates._fanart_candidates(
+                client,
+                _request(),
+                candidates._Identity(("Chocolat",), False),
+                _settings(fanart_project_api_key=""),
+            )
+        self.assertEqual(len(values), 1)
+        self.assertEqual(
+            values[0].url,
+            "https://assets.fanart.tv/fanart/chocolat-5fd9cd5bcc022.jpg",
+        )
 
     async def test_series_fanart_returns_no_candidates_without_verified_tvdb_identity(self):
         handler = AsyncMock()

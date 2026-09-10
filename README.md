@@ -156,8 +156,8 @@ All configuration is done via environment variables. Copy `.env.example` to `.en
 | `TVDB_TYPES_CACHE_DURATION` | `30` | Days to cache the TVDB artwork-type catalogue, which rarely changes |
 | `ACCESS_KEY` | - | Shared secret for request authentication. Leave blank to allow open access |
 | `JELLYFIN_ARTWORK_DISCOVERY_KEY` | derived | Optional discovery-only key. When unset, it is HMAC-SHA256-derived from `ACCESS_KEY` with the fixed `jellyfin-artwork-discovery-v1` context |
-| `JELLYFIN_ARTWORK_FANART_PROJECT_API_KEY` | - | Fanart.tv project key used only by bounded candidate discovery |
-| `JELLYFIN_ARTWORK_FANART_CLIENT_KEY` | - | Fanart.tv client key used only by bounded candidate discovery |
+| `JELLYFIN_ARTWORK_FANART_PROJECT_API_KEY` | - | Optional Fanart.tv project key; either Fanart key enables bounded candidate discovery |
+| `JELLYFIN_ARTWORK_FANART_CLIENT_KEY` | - | Optional Fanart.tv personal key; may be used alone and takes priority when both keys are set |
 | `RENDER_PROFILE_PATH` | - | Read-only schema-2 YAML profile for `POST /render/selection` |
 | `POSTERSPLUS_RENDERER_REVISION` | - | Full 40-character fork commit, supplied by the image build and exposed separately from the pinned upstream revision |
 | `WORKERS` | `1` | Uvicorn worker processes. One worker avoids duplicate uncached renders, scans, and API work across processes |
