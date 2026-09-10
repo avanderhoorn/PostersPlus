@@ -177,8 +177,8 @@ These settings are read from the environment only, never from the dashboard:
 | Variable | Default | Description |
 |---|---|---|
 | `JELLYFIN_ARTWORK_DISCOVERY_KEY` | derived | Optional discovery-only key. When unset, it is HMAC-SHA256-derived from `ACCESS_KEY` with the fixed `jellyfin-artwork-discovery-v1` context |
-| `JELLYFIN_ARTWORK_FANART_PROJECT_API_KEY` | - | Fanart.tv project key used only by bounded candidate discovery |
-| `JELLYFIN_ARTWORK_FANART_CLIENT_KEY` | - | Fanart.tv client key used only by bounded candidate discovery |
+| `JELLYFIN_ARTWORK_FANART_PROJECT_API_KEY` | - | Optional Fanart.tv project key; either Fanart key enables bounded candidate discovery |
+| `JELLYFIN_ARTWORK_FANART_CLIENT_KEY` | - | Optional Fanart.tv personal key; may be used alone and takes priority when both keys are set |
 | `RENDER_PROFILE_PATH` | - | Read-only schema-2 YAML profile for `POST /render/selection` |
 | `POSTERSPLUS_RENDERER_REVISION` | - | Full 40-character fork commit, supplied by the image build |
 | `SELECTED_MAX_BYTES` / `_WIDTH` / `_HEIGHT` / `_PIXELS` | 10 MiB / 8000 / 8000 / 20 MP | Bounds on a selected input image |
