@@ -537,10 +537,14 @@ async def _bounded_response_bytes(
     max_bytes: int,
 ) -> tuple[bytes, str]:
     try:
+        # The byte bound reads the raw body and refuses Content-Encoding, so ask
+        # for identity here: the shared client's httpx default (gzip, deflate)
+        # makes TMDB gzip its JSON, which would fail every discovery.
         async with client.stream(
             "GET",
             url,
             params=params,
+            headers={"Accept-Encoding": "identity"},
             follow_redirects=False,
         ) as response:
             if 300 <= response.status_code < 400:

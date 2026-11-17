@@ -433,6 +433,42 @@ class AdapterTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(identity.titles, ("Expected",))
         self.assertFalse(identity.tvdb_verified)
 
+    async def test_identity_reads_uncompressed_through_the_production_client(self):
+        # TMDB gzips JSON whenever the request allows it, and the production
+        # client leaves httpx's default Accept-Encoding (gzip, deflate) in
+        # place. Discovery refuses Content-Encoding, so it must ask for identity.
+        seen = []
+
+        async def handler(request):
+            seen.append(request.headers.get("accept-encoding"))
+            body = json.dumps({
+                "id": 123,
+                "title": "Expected",
+                "external_ids": {"imdb_id": "tt1234567"},
+            }).encode()
+            headers = {"Content-Type": "application/json"}
+            if "gzip" in request.headers.get("accept-encoding", ""):
+                body = gzip.compress(body)
+                headers["Content-Encoding"] = "gzip"
+            return httpx.Response(200, stream=httpx.ByteStream(body), headers=headers)
+
+        production = main._make_http_client()
+        try:
+            async with httpx.AsyncClient(
+                transport=httpx.MockTransport(handler),
+                headers=production.headers,
+                event_hooks=production.event_hooks,
+            ) as client:
+                identity = await candidates._fetch_identity(
+                    client,
+                    _request(),
+                    _settings(),
+                )
+        finally:
+            await production.aclose()
+        self.assertEqual(identity.titles, ("Expected",))
+        self.assertEqual(seen, ["identity"])
+
 
 class ImageAndOcrTests(unittest.IsolatedAsyncioTestCase):
     def setUp(self):
