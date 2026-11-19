@@ -29,3 +29,8 @@ python-bidi>=0.6,<1
 # Preparing fonts the operator uploads as label fonts (custom_fonts, fontprep):
 # CFF outlines to TrueType, the ★ added.  Imported only on upload.
 fonttools>=4.50,<5
+# Homestack: hold FastAPI and its annotated-doc dependency at the versions the
+# previous production build resolved (11-17), so a rebuild only takes reviewed
+# and cooled packages. Raise both together after their cooling window.
+fastapi==0.163.1
+annotated-doc==0.0.6
