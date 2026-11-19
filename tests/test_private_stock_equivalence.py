@@ -10,7 +10,7 @@ from PIL import Image, ImageDraw
 import main
 
 
-UPSTREAM_REVISION = "fb08ed4b2a4d49ad013d4bd716ddef3d871a5acf"
+UPSTREAM_REVISION = "86cfba81f6b360f05512b10df72e7ce15cf600e7"
 
 
 def _pristine_source(path: str) -> str:
@@ -61,13 +61,13 @@ class StockEquivalenceTests(unittest.TestCase):
     @classmethod
     def setUpClass(cls):
         source = _pristine_source("main.py")
-        pristine = types.ModuleType("postersplus_pristine_fb08ed4b")
+        pristine = types.ModuleType("postersplus_pristine_86cfba81")
         pristine.__file__ = str(Path(main.__file__).resolve())
         exec(compile(source, f"{UPSTREAM_REVISION}:main.py", "exec"), pristine.__dict__)
         cls.pristine = pristine
         cls.pristine_source = source
         cls.pristine_tmdb_source = _pristine_source("tmdb.py")
-        pristine_tmdb = types.ModuleType("postersplus_pristine_tmdb_fb08ed4b")
+        pristine_tmdb = types.ModuleType("postersplus_pristine_tmdb_86cfba81")
         pristine_tmdb.__file__ = str(
             Path(main.__file__).resolve().with_name("tmdb.py")
         )

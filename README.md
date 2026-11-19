@@ -163,7 +163,7 @@ IMDb is optional when TMDb can provide the remaining metadata.
 which stay separate in readiness and render responses:
 
 - `upstream_revision` / `X-Upstream-Revision` is pinned to
-  `fb08ed4b2a4d49ad013d4bd716ddef3d871a5acf`;
+  `86cfba81f6b360f05512b10df72e7ce15cf600e7`;
 - `renderer_revision` / `X-Renderer-Revision` is the full fork commit supplied
   through `POSTERSPLUS_RENDERER_REVISION`.
 

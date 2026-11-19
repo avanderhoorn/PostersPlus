@@ -121,7 +121,7 @@ JELLYFIN_ARTWORK_FANART_CLIENT_KEY = os.environ.get(
     "JELLYFIN_ARTWORK_FANART_CLIENT_KEY", ""
 ).strip()
 RENDER_PROFILE_PATH   = os.environ.get("RENDER_PROFILE_PATH", "").strip()
-UPSTREAM_REVISION     = "fb08ed4b2a4d49ad013d4bd716ddef3d871a5acf"
+UPSTREAM_REVISION     = "86cfba81f6b360f05512b10df72e7ce15cf600e7"
 RENDERER_REVISION     = os.environ.get(
     "POSTERSPLUS_RENDERER_REVISION", ""
 ).strip().lower()

@@ -19,7 +19,7 @@ from private_adapter import SelectionContext, effective_logo_sha256
 from render_profile import RenderProfile, RenderProfileError, load_render_profile
 
 
-UPSTREAM_REVISION = "fb08ed4b2a4d49ad013d4bd716ddef3d871a5acf"
+UPSTREAM_REVISION = "86cfba81f6b360f05512b10df72e7ce15cf600e7"
 RENDERER_REVISION = "a" * 40
 
 
